@@ -70,14 +70,17 @@ image = (
     .env({"PATH": "/root/.deno/bin:$PATH"})
 )
 
-# Extra yt-dlp flags: use the JS runtime above, and don't hard-fail just
-# because a PO token couldn't be minted for some reason - degraded formats
-# are still better than nothing.
+# Extra yt-dlp flags: use the JS runtime above, don't hard-fail just
+# because a PO token couldn't be minted, and force the "web" client -
+# yt-dlp's default clients here (android_vr, web_safari) returned
+# LOGIN_REQUIRED even with valid cookies attached, which points to them
+# not actually being cookie-aware; "web" is the client cookies are
+# actually designed for.
 YT_DLP_EXTRA_ARGS = [
     "--js-runtimes",
     "deno",
     "--extractor-args",
-    "youtube:formats=missing_pot",
+    "youtube:formats=missing_pot;player_client=web",
 ]
 
 # Modal spins up a fresh container per call - without this, every single
