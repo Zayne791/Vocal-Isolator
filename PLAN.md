@@ -43,6 +43,29 @@ the same line.
 - **Access.** Unlisted link only, no PIN (your call). Worth revisiting if
   the link ever gets shared beyond the household.
 
+## Known limitation: YouTube blocking cloud IPs
+
+yt-dlp downloads sometimes fail (`Video unavailable`, `HTTP Error 403`)
+regardless of the specific song or video — this is YouTube's anti-bot
+system flagging Modal's (or any cloud provider's) IP address, not a bug in
+this app. It's tested identically across multiple videos and every
+internal yt-dlp "client" mode. Mitigations already in place: yt-dlp is
+always installed unpinned (gets fixes as soon as they ship), a JS runtime
+(deno) is installed in the image since yt-dlp increasingly needs one, and
+`formats=missing_pot` tells it to still try even without YouTube's newer
+proof-of-origin token. None of these fix a genuine IP-reputation block.
+
+If failures are frequent, the standard next step is passing yt-dlp a
+`cookies.txt` exported from a real, logged-in browser session (via a
+Modal Secret, never committed to the repo) — authenticated requests get
+much more lenient treatment than anonymous datacenter traffic. Not built
+yet since it needs a real browser session to export from and has to be
+refreshed occasionally; worth doing if this keeps happening.
+
+Check `modal app logs neville-song-stripper` (or the Logs tab in Modal's
+dashboard) for the real yt-dlp/ffmpeg output on any failure — every stage
+of the pipeline logs there now.
+
 ## Legal/ethical note
 
 Downloading YouTube audio for personal, non-shared use is common
