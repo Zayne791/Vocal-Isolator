@@ -11,6 +11,10 @@ const WORKING_PHRASES = [
   "Almost done…",
 ];
 
+const POLL_INTERVAL_MS = 3000;
+const POLL_TIMEOUT_MS = 15000;
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+
 type Phase = "idle" | "working" | "done" | "error";
 
 type DoneResult = {
@@ -40,13 +44,13 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
-      if (pollTimer.current) clearInterval(pollTimer.current);
+      if (pollTimer.current) clearTimeout(pollTimer.current);
       if (phraseTimer.current) clearInterval(phraseTimer.current);
     };
   }, []);
 
   function stopTimers() {
-    if (pollTimer.current) clearInterval(pollTimer.current);
+    if (pollTimer.current) clearTimeout(pollTimer.current);
     if (phraseTimer.current) clearInterval(phraseTimer.current);
   }
 
@@ -102,25 +106,33 @@ export default function Home() {
 
       const { call_id } = await startResponse.json();
 
-      pollTimer.current = setInterval(async () => {
-        setProgress((p) => Math.min(p + 4, 92));
+      let consecutiveFailures = 0;
+
+      const pollStatus = async () => {
+        const controller = new AbortController();
+        const abortTimer = setTimeout(() => controller.abort(), POLL_TIMEOUT_MS);
 
         try {
-          const statusResponse = await fetch(`${API_BASE}/status?call_id=${call_id}`);
+          const statusResponse = await fetch(`${API_BASE}/status?call_id=${call_id}`, {
+            signal: controller.signal,
+          });
           const statusBody = await statusResponse.json();
+          consecutiveFailures = 0;
 
           if (statusBody.state === "pending") {
+            setProgress((p) => Math.min(p + 4, 92));
+            pollTimer.current = setTimeout(pollStatus, POLL_INTERVAL_MS);
             return;
           }
 
-          stopTimers();
-
           if (statusBody.state === "error") {
+            stopTimers();
             setPhase("error");
             setError(statusBody.message || "Something went wrong separating that song. Please try again.");
             return;
           }
 
+          stopTimers();
           setProgress(100);
           setResult({
             filename: statusBody.filename,
@@ -128,11 +140,23 @@ export default function Home() {
           });
           setPhase("done");
         } catch {
-          stopTimers();
-          setPhase("error");
-          setError("Lost connection while working on that song. Please try again.");
+          // A single stalled request (flaky connection, backgrounded tab)
+          // shouldn't kill the whole job - only give up after several in a row.
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            stopTimers();
+            setPhase("error");
+            setError("Lost connection while working on that song. Please try again.");
+            return;
+          }
+          setProgress((p) => Math.min(p + 4, 92));
+          pollTimer.current = setTimeout(pollStatus, POLL_INTERVAL_MS);
+        } finally {
+          clearTimeout(abortTimer);
         }
-      }, 3000);
+      };
+
+      pollTimer.current = setTimeout(pollStatus, POLL_INTERVAL_MS);
     } catch (err) {
       stopTimers();
       setPhase("error");
@@ -187,7 +211,7 @@ export default function Home() {
             <div className={styles.progressTrack}>
               <div className={styles.progressFill} style={{ width: `${progress}%` }} />
             </div>
-            <p className={styles.statusCopy}>Working on it…</p>
+            <p className={styles.statusCopy}>Working on it… {progress}%</p>
           </>
         ) : null}
 
