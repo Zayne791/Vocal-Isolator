@@ -32,8 +32,21 @@ image = (
     )
 )
 
+# Modal spins up a fresh container per call - without this, every single
+# song would re-download the ~1-2GB separation model from scratch. This
+# volume persists that download across calls, so only the very first run
+# after a deploy pays the download cost.
+model_cache = modal.Volume.from_name("neville-song-stripper-models", create_if_missing=True)
+MODEL_CACHE_DIR = "/cache/audio-separator-models"
 
-@app.function(image=image, timeout=900, cpu=4, memory=4096)
+
+@app.function(
+    image=image,
+    timeout=900,
+    cpu=4,
+    memory=4096,
+    volumes={"/cache": model_cache},
+)
 def run_pipeline(youtube_url: str) -> dict:
     import glob
     import os
@@ -70,8 +83,9 @@ def run_pipeline(youtube_url: str) -> dict:
         raise RuntimeError("Couldn't find a downloaded audio file for that link.")
     input_path = input_matches[0]
 
-    separator = Separator(output_dir=work_dir)
+    separator = Separator(output_dir=work_dir, model_file_dir=MODEL_CACHE_DIR)
     separator.load_model(model_filename=KARAOKE_MODEL)
+    model_cache.commit()
     output_files = separator.separate(input_path)
 
     instrumental_path = next(
