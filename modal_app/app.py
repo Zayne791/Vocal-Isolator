@@ -70,10 +70,26 @@ def run_pipeline(audio_bytes: bytes, original_filename: str) -> dict:
 
     work_dir = tempfile.mkdtemp()
     input_ext = os.path.splitext(original_filename)[1] or ".mp3"
-    input_path = os.path.join(work_dir, f"input{input_ext}")
-    with open(input_path, "wb") as f:
+    raw_path = os.path.join(work_dir, f"upload{input_ext}")
+    with open(raw_path, "wb") as f:
         f.write(audio_bytes)
-    log(f"Saved upload ({len(audio_bytes)} bytes) to {input_path}")
+    log(f"Saved upload ({len(audio_bytes)} bytes) to {raw_path}")
+
+    # Normalize whatever got uploaded - mp3, m4a, a video file with an
+    # audio track, anything ffmpeg understands - into a clean wav. Avoids
+    # depending on the separation library's own format support, and means
+    # picking the "wrong" file type on a phone (e.g. audio saved inside an
+    # mp4 container) still just works.
+    input_path = os.path.join(work_dir, "input.wav")
+    log("Normalizing upload to wav")
+    normalize = subprocess.run(
+        ["ffmpeg", "-y", "-i", raw_path, input_path],
+        capture_output=True,
+        text=True,
+    )
+    if normalize.returncode != 0:
+        log(f"ffmpeg stderr:\n{normalize.stderr}")
+        raise RuntimeError(f"Couldn't read that file as audio: {_tail_error(normalize.stderr)}")
 
     log(f"Loading separation model {KARAOKE_MODEL}")
     separator = Separator(output_dir=work_dir, model_file_dir=MODEL_CACHE_DIR)

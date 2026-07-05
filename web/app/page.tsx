@@ -156,7 +156,7 @@ export default function Home() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="audio/*"
+              accept="audio/*,video/mp4,.mp3,.m4a,.wav,.aac,.ogg,.flac,.mp4"
               onChange={(e) => setFile(e.target.files?.[0] ?? null)}
               style={{ display: "none" }}
               aria-label="Choose a song file"
