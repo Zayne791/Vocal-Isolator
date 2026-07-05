@@ -25,7 +25,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
     .pip_install(
-        "audio-separator[cpu]",
+        "audio-separator[gpu]",
         "fastapi[standard]",
         "python-multipart",
     )
@@ -53,6 +53,7 @@ def _tail_error(text: str) -> str:
     timeout=900,
     cpu=4,
     memory=4096,
+    gpu="T4",
     volumes={"/cache": model_cache},
 )
 def run_pipeline(audio_bytes: bytes, original_filename: str) -> dict:
