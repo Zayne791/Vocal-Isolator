@@ -1,0 +1,45 @@
+name: Deploy Modal backend
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - claude/neville-vocal-removal-site-g6luhi
+    paths:
+      - "modal_app/**"
+      - ".github/workflows/deploy-modal.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Deploy to Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: modal deploy modal_app/app.py | tee deploy_output.txt
+
+      - name: Write the live URL to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Your Modal backend URL"
+            echo ""
+            urls=$(grep -o 'https://[a-zA-Z0-9.-]*\.modal\.run[^[:space:]]*' deploy_output.txt | sort -u)
+            if [ -z "$urls" ]; then
+              echo "No URL found in the deploy output above - check the full log for errors."
+            else
+              echo "Paste this into Vercel's \`NEXT_PUBLIC_STRIPPER_API_URL\` (no trailing slash):"
+              echo ""
+              echo "$urls" | while read -r url; do echo "\`\`\`"; echo "$url"; echo "\`\`\`"; done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
