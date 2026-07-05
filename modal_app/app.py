@@ -149,6 +149,7 @@ def _run_pipeline(youtube_url: str) -> dict:
     download = subprocess.run(
         [
             "yt-dlp",
+            "-v",
             "-x",
             "--audio-format",
             "wav",
@@ -162,10 +163,12 @@ def _run_pipeline(youtube_url: str) -> dict:
         text=True,
     )
     log(f"yt-dlp exited {download.returncode}")
+    # Full output, not just the tail - with -v, the PO-token-provider debug
+    # lines that matter most for diagnosing failures are near the *start*.
     if download.stdout:
-        log(f"yt-dlp stdout tail:\n{download.stdout[-2000:]}")
+        log(f"yt-dlp stdout:\n{download.stdout}")
     if download.stderr:
-        log(f"yt-dlp stderr tail:\n{download.stderr[-2000:]}")
+        log(f"yt-dlp stderr:\n{download.stderr}")
 
     if download.returncode != 0:
         raise RuntimeError(
