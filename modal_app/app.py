@@ -163,7 +163,21 @@ def _run_pipeline(youtube_url: str) -> dict:
         with open(cookies_path, "w") as f:
             f.write(cookies_content)
         yt_dlp_args += ["--cookies", cookies_path]
-        log("Using cookies from the youtube-cookies Modal secret")
+
+        # Diagnostic only - names, never values, so nothing sensitive is
+        # logged. Checks the file actually has the auth cookies YouTube
+        # needs, not just a valid-looking but incomplete/wrong export.
+        cookie_lines = [
+            line for line in cookies_content.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        cookie_names = [line.split("\t")[5] for line in cookie_lines if line.count("\t") >= 5]
+        required = {"SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-3PAPISID", "__Secure-1PSID"}
+        found_required = required & set(cookie_names)
+        log(
+            f"Using cookies from the youtube-cookies Modal secret "
+            f"({len(cookie_lines)} cookie lines, auth cookies present: {sorted(found_required) or 'NONE'})"
+        )
     else:
         log("No COOKIES_TXT secret value found - proceeding without cookies")
 
