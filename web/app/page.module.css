@@ -61,15 +61,25 @@
   padding: 18px 22px;
   font-size: 16px;
   color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .field::placeholder {
   color: var(--text-faint);
 }
 
-.field:focus {
+.field:focus,
+.field:focus-visible {
   outline: none;
   border-color: var(--accent);
+}
+
+.fieldEmpty {
+  color: var(--text-faint);
 }
 
 .field:focus-visible {
