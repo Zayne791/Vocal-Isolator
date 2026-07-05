@@ -22,25 +22,57 @@ KARAOKE_MODEL = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
 
 app = modal.App("neville-song-stripper")
 
+BGUTIL_PROVIDER_DIR = "/opt/bgutil-provider/server"
+BGUTIL_PROVIDER_PORT = 4416
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "curl", "unzip")
+    .apt_install("ffmpeg", "curl", "unzip", "git")
+    # Native build deps for the bgutil provider server's "canvas" dependency.
+    .apt_install(
+        "build-essential",
+        "pkg-config",
+        "libcairo2-dev",
+        "libpango1.0-dev",
+        "libjpeg-dev",
+        "libgif-dev",
+        "librsvg2-dev",
+    )
+    # bgutil's server needs Node >=20; Debian's own package is often older.
+    .run_commands(
+        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+        "apt-get install -y nodejs",
+    )
     .pip_install(
         "yt-dlp",
         "audio-separator[cpu]",
         "fastapi[standard]",
+        "bgutil-ytdlp-pot-provider",
+    )
+    # A "PO token provider" - mints the proof-of-origin token YouTube now
+    # requires before it'll hand over real download URLs to automated
+    # clients. Without this, cloud-IP requests get rejected outright with
+    # "Sign in to confirm you're not a bot" regardless of the video. Runs
+    # as a small local HTTP server (see SongStripper.start_pot_provider
+    # below); yt-dlp's plugin auto-detects it on the default port, no
+    # extra flags needed. See PLAN.md for why this exists instead of
+    # cookies. Pinned to a tag rather than main so an upstream change
+    # can't silently break builds.
+    .run_commands(
+        f"git clone --single-branch --branch 1.3.1 "
+        f"https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-provider",
+        f"cd {BGUTIL_PROVIDER_DIR} && npm ci && npx tsc",
     )
     # yt-dlp increasingly needs a JS runtime to solve YouTube's playback
-    # challenges - deno is the one it looks for by default. Doesn't fix
-    # IP-reputation blocks (see YT_DLP_EXTRA_ARGS below and PLAN.md), but
-    # it's a real, separate failure mode worth closing off.
+    # challenges - deno is the one it looks for by default. Separate from
+    # the PO token issue above, but a real failure mode worth closing off.
     .run_commands("curl -fsSL https://deno.land/install.sh | sh -s -- -y")
     .env({"PATH": "/root/.deno/bin:$PATH"})
 )
 
 # Extra yt-dlp flags: use the JS runtime above, and don't hard-fail just
-# because a PO token (YouTube's newer anti-bot proof-of-origin check)
-# couldn't be minted - degraded formats are still better than nothing.
+# because a PO token couldn't be minted for some reason - degraded formats
+# are still better than nothing.
 YT_DLP_EXTRA_ARGS = [
     "--js-runtimes",
     "deno",
@@ -65,14 +97,38 @@ def _tail_error(text: str) -> str:
     return lines[-1] if lines else "no error output"
 
 
-@app.function(
+@app.cls(
     image=image,
     timeout=900,
     cpu=4,
     memory=4096,
     volumes={"/cache": model_cache},
 )
-def run_pipeline(youtube_url: str) -> dict:
+class SongStripper:
+    @modal.enter()
+    def start_pot_provider(self):
+        import socket
+        import subprocess
+        import time
+
+        self._pot_process = subprocess.Popen(
+            ["node", "build/main.js", "--port", str(BGUTIL_PROVIDER_PORT)],
+            cwd=BGUTIL_PROVIDER_DIR,
+        )
+        for _ in range(30):
+            try:
+                with socket.create_connection(("127.0.0.1", BGUTIL_PROVIDER_PORT), timeout=1):
+                    return
+            except OSError:
+                time.sleep(1)
+        raise RuntimeError("PO token provider server didn't come up in time.")
+
+    @modal.method()
+    def run(self, youtube_url: str) -> dict:
+        return _run_pipeline(youtube_url)
+
+
+def _run_pipeline(youtube_url: str) -> dict:
     import glob
     import os
     import subprocess
@@ -202,7 +258,7 @@ def web():
         if not youtube_url:
             return JSONResponse({"error": "Paste a YouTube link first."}, status_code=400)
 
-        call = run_pipeline.spawn(youtube_url)
+        call = SongStripper().run.spawn(youtube_url)
         return {"call_id": call.object_id}
 
     @web_app.get("/status")
