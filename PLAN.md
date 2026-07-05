@@ -2,14 +2,45 @@
 
 ## What it does
 
-Paste a YouTube link, tap one button, get an MP3 back with the lead
-vocal removed and everything else — instruments and backing/harmony
-vocals — left intact.
+Upload a song file, tap one button, get an MP3 back with the lead vocal
+removed and everything else — instruments and backing/harmony vocals —
+left intact.
 
-## How the two hard problems get solved
+## History: this used to work off a pasted YouTube link
 
-1. **Getting audio off YouTube.** `yt-dlp` (free, open source) pulls the
-   best audio stream. No API key, no per-call cost.
+The original design took a YouTube link and used `yt-dlp` to pull the
+audio server-side. That was abandoned after extensive real testing:
+YouTube's anti-bot system blocks/challenges cloud IPs (Modal's, and any
+other cloud provider's) hard enough that no combination of fixes held up
+reliably:
+
+1. A JS runtime (deno) - necessary but not sufficient on its own.
+2. A PO token provider (`bgutil-ytdlp-pot-provider`) - genuinely helped
+   (confirmed working, got a real proof-of-origin token), but YouTube
+   still returned `LOGIN_REQUIRED` regardless, since that specific check
+   demands an authenticated session, not just a valid token.
+3. Cookies from a real, logged-in browser session - this got furthest
+   (one full successful run, proving the rest of the pipeline correct),
+   but the exported session got invalidated within minutes, most likely
+   because Google's fraud detection flags a session cookie being used
+   from a wildly different IP (a residential export vs. Modal's
+   datacenter IP) and rotates it as a security response. The standard
+   community mitigations (private-window export, ~2 week typical
+   lifespan) don't reliably apply here for the same reason.
+
+None of this is a bug in this app — it's YouTube's infrastructure
+actively fighting exactly this kind of automated access, and winning.
+Continuing to chase it would mean either a recurring paid residential
+proxy (real ongoing cost, still not guaranteed) or accepting permanent
+fragility. **Decision: drop server-side YouTube extraction entirely.**
+Whatever legal means Zayne/Neville use to get a song onto a device is
+now out of this app's scope — the app's job starts at "here's an audio
+file."
+
+## How it works now
+
+1. **Upload.** The browser sends an audio file straight to the backend.
+   No extraction, no bot-detection surface at all.
 2. **Removing only the lead singer.** Plain "vocal remover" models (Spleeter,
    stock Demucs) only split vocals-vs-instrumental as one blob — they don't
    keep backing vocals. The actual fit is the "karaoke" model family from the
@@ -25,17 +56,19 @@ the same line.
 
 ## Architecture (decided)
 
-- **Frontend — Vercel.** A single Next.js page (`web/`). One input, one
-  button, one download link at a time. No accounts, no settings menu.
+- **Frontend — Vercel.** A single Next.js page (`web/`). One file-picker,
+  one button, one download link at a time. No accounts, no settings menu.
 - **Backend — Modal.** A Python serverless app (`modal_app/app.py`) that
-  does `yt-dlp` → `ffmpeg` → UVR karaoke separation → `ffmpeg` mp3, and
-  exposes it over HTTP. Modal scales to zero between requests — no idle
+  takes an uploaded file straight to UVR karaoke separation → `ffmpeg`
+  mp3, exposed over HTTP. Modal scales to zero between requests — no idle
   server bill — and gives ~$30/month free credit, which comfortably covers
   one household's occasional use. **Vercel alone can't run this part**:
   its serverless functions can't hold multi-GB ML model files, run
   PyTorch/ONNX inference, or run for the several minutes separation takes.
   Splitting frontend (Vercel) from heavy compute (Modal) is what makes
-  "cheap cheap cheap" and "runs on Vercel" both true at once.
+  "cheap cheap cheap" and "runs on Vercel" both true at once. This is now
+  a genuinely simple image — just `ffmpeg` + the separation library, no
+  Node, no browser automation, no secrets to manage.
 - **Delivery.** Plain MP3 download link — no Google Drive API integration.
   Tapping download on Android/ChromeOS already offers "Save to Drive" from
   the native share sheet, with zero OAuth setup, zero token-expiry
@@ -43,60 +76,22 @@ the same line.
 - **Access.** Unlisted link only, no PIN (your call). Worth revisiting if
   the link ever gets shared beyond the household.
 
-## Known limitation: YouTube blocking cloud IPs
-
-yt-dlp downloads sometimes fail (`Video unavailable`, `403 Forbidden`,
-`LOGIN_REQUIRED`) regardless of the specific song or video — this is
-YouTube's anti-bot system flagging Modal's (or any cloud provider's) IP
-address, not a bug in this app. Confirmed by testing multiple unrelated
-videos and every internal yt-dlp "client" mode identically.
-
-Two mitigations are layered in, in the order they were tried:
-
-1. **A JS runtime (deno)** — yt-dlp increasingly needs one to solve
-   YouTube's playback challenges. Necessary but not sufficient on its own.
-2. **A PO token provider** (`bgutil-ytdlp-pot-provider`, runs as a local
-   HTTP server started once per container via `@modal.enter()`) — mints
-   the proof-of-origin token automated clients now need. Confirmed
-   working (registers as an available provider), but on its own it
-   doesn't clear everything: YouTube returned `LOGIN_REQUIRED` for
-   Modal's IPs even with a valid token, since that status specifically
-   demands a real signed-in session, a different check than what PO
-   tokens answer.
-3. **Cookies from a real, logged-in browser session** — the actual fix
-   for `LOGIN_REQUIRED`. Passed via `--cookies`, sourced from a Modal
-   Secret named `youtube-cookies` (key `COOKIES_TXT`, value = the full
-   contents of an exported cookies.txt) — never committed to this repo.
-   Falls back to running without cookies if the secret's value is empty,
-   so a missing/expired cookie file degrades rather than breaking the
-   whole app.
-
-Cookies expire/rotate over time (weeks to months) and need re-exporting
-and re-pasting into the Modal Secret when that happens — see README.md
-for the exact steps. Use a secondary/throwaway Google account for this
-rather than a primary one, since automated use carries some risk of the
-account itself getting flagged.
-
-Check `modal app logs neville-song-stripper` (or the Logs tab in Modal's
-dashboard) for the real yt-dlp/ffmpeg verbose output on any failure —
-every stage of the pipeline logs there now, including whether cookies
-were actually used for that request.
-
 ## Legal/ethical note
 
-Downloading YouTube audio for personal, non-shared use is common
-hobbyist practice but technically against YouTube's Terms of Service.
-Keeping this private — not published anywhere, not a public product,
-output files not redistributed — keeps the risk essentially theoretical.
+This app itself only separates a file you already have — it doesn't
+download or redistribute anything. However you get that file onto a
+device is between you and whatever service it came from.
 
 ## Build order
 
 1. ~~Confirm the karaoke separation model exists and its API matches what
    the code expects~~ — done (see `modal_app/app.py` comments).
-2. ~~Backend pipeline as Modal app~~ — done, needs deployment.
-3. ~~One-page frontend in the theme~~ — done, needs deployment.
-4. Deploy `modal_app/app.py` to Modal, get its web URL.
-5. Deploy `web/` to Vercel with `NEXT_PUBLIC_STRIPPER_API_URL` set to that
+2. ~~YouTube-link based pipeline~~ — built, tested extensively, abandoned
+   due to YouTube's IP/bot blocking (see History above).
+3. ~~File-upload based pipeline~~ — done, needs deployment.
+4. ~~One-page frontend in the theme~~ — done, needs deployment.
+5. Deploy `modal_app/app.py` to Modal, get its web URL.
+6. Deploy `web/` to Vercel with `NEXT_PUBLIC_STRIPPER_API_URL` set to that
    URL. See `README.md` for exact steps.
-6. Test the real end-to-end tap-to-download flow on Neville's actual
-   device.
+7. Test the real end-to-end tap-to-download flow on Neville's actual
+   device, with a real song file.

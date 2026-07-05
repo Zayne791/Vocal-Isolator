@@ -6,7 +6,7 @@ import styles from "./page.module.css";
 const API_BASE = process.env.NEXT_PUBLIC_STRIPPER_API_URL;
 
 const WORKING_PHRASES = [
-  "Downloading the song…",
+  "Listening to the song…",
   "Finding the singer's voice…",
   "Almost done…",
 ];
@@ -18,10 +18,6 @@ type DoneResult = {
   audioUrl: string;
 };
 
-function looksLikeYoutubeLink(value: string) {
-  return /(youtube\.com|youtu\.be)/i.test(value.trim());
-}
-
 function base64ToBlobUrl(base64: string, mimeType: string) {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -32,7 +28,7 @@ function base64ToBlobUrl(base64: string, mimeType: string) {
 }
 
 export default function Home() {
-  const [link, setLink] = useState("");
+  const [file, setFile] = useState<File | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState("");
   const [phraseIndex, setPhraseIndex] = useState(0);
@@ -40,6 +36,7 @@ export default function Home() {
   const [result, setResult] = useState<DoneResult | null>(null);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phraseTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     return () => {
@@ -56,7 +53,7 @@ export default function Home() {
   function resetToIdle() {
     stopTimers();
     setPhase("idle");
-    setLink("");
+    setFile(null);
     setResult(null);
     setError("");
     setProgress(8);
@@ -74,11 +71,9 @@ export default function Home() {
       return;
     }
 
-    if (!looksLikeYoutubeLink(link)) {
+    if (!file) {
       setPhase("error");
-      setError(
-        "That doesn't look like a YouTube link. Go to YouTube, tap Share, and paste what it copies here."
-      );
+      setError("Choose a song file first.");
       return;
     }
 
@@ -92,15 +87,17 @@ export default function Home() {
     }, 6000);
 
     try {
+      const formData = new FormData();
+      formData.append("file", file);
+
       const startResponse = await fetch(`${API_BASE}/start`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ youtube_url: link.trim() }),
+        body: formData,
       });
 
       if (!startResponse.ok) {
         const body = await startResponse.json().catch(() => null);
-        throw new Error(body?.error || "Couldn't start on that link. Please try again.");
+        throw new Error(body?.error || "Couldn't start on that file. Please try again.");
       }
 
       const { call_id } = await startResponse.json();
@@ -152,19 +149,25 @@ export default function Home() {
 
         {phase === "idle" || phase === "error" ? (
           <form className={styles.form} onSubmit={handleSubmit}>
-            <h1 className={styles.headline}>Paste your song link below</h1>
+            <h1 className={styles.headline}>Choose a song to upload</h1>
             <p className={styles.subline}>
-              Copy it from YouTube, then paste it here.
+              Pick an MP3 (or other audio file) from your device.
             </p>
             <input
-              className={styles.field}
-              type="text"
-              inputMode="url"
-              placeholder="youtube.com/watch?v=..."
-              value={link}
-              onChange={(e) => setLink(e.target.value)}
-              aria-label="YouTube link"
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              style={{ display: "none" }}
+              aria-label="Choose a song file"
             />
+            <button
+              type="button"
+              className={`${styles.field} ${file ? "" : styles.fieldEmpty}`}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {file ? file.name : "Tap to choose a file"}
+            </button>
             {phase === "error" && <div className={styles.errorBanner}>{error}</div>}
             <button className={styles.cta} type="submit">
               Remove the singer
