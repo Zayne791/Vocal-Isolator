@@ -87,6 +87,13 @@ YT_DLP_EXTRA_ARGS = [
 model_cache = modal.Volume.from_name("neville-song-stripper-models", create_if_missing=True)
 MODEL_CACHE_DIR = "/cache/audio-separator-models"
 
+# PO tokens alone weren't enough - YouTube returned LOGIN_REQUIRED for
+# Modal's IPs regardless (see PLAN.md). A cookies.txt from a real signed-in
+# session, stored as a Modal Secret (never in this repo), is the actual
+# fix. Create it via the Modal dashboard: Secrets -> New Secret -> key
+# COOKIES_TXT, value = the full contents of an exported cookies.txt file.
+COOKIES_SECRET_NAME = "youtube-cookies"
+
 
 def _tail_error(text: str) -> str:
     """Pull the most useful line out of a CLI tool's stderr for the UI."""
@@ -103,6 +110,7 @@ def _tail_error(text: str) -> str:
     cpu=4,
     memory=4096,
     volumes={"/cache": model_cache},
+    secrets=[modal.Secret.from_name(COOKIES_SECRET_NAME)],
 )
 class SongStripper:
     @modal.enter()
@@ -145,6 +153,17 @@ def _run_pipeline(youtube_url: str) -> dict:
     work_dir = tempfile.mkdtemp()
     input_template = os.path.join(work_dir, "input.%(ext)s")
 
+    yt_dlp_args = list(YT_DLP_EXTRA_ARGS)
+    cookies_content = os.environ.get("COOKIES_TXT")
+    if cookies_content:
+        cookies_path = os.path.join(work_dir, "cookies.txt")
+        with open(cookies_path, "w") as f:
+            f.write(cookies_content)
+        yt_dlp_args += ["--cookies", cookies_path]
+        log("Using cookies from the youtube-cookies Modal secret")
+    else:
+        log("No COOKIES_TXT secret value found - proceeding without cookies")
+
     log("Starting yt-dlp download")
     download = subprocess.run(
         [
@@ -154,7 +173,7 @@ def _run_pipeline(youtube_url: str) -> dict:
             "--audio-format",
             "wav",
             "--no-playlist",
-            *YT_DLP_EXTRA_ARGS,
+            *yt_dlp_args,
             "-o",
             input_template,
             youtube_url,
@@ -223,7 +242,7 @@ def _run_pipeline(youtube_url: str) -> dict:
         raise RuntimeError(f"Couldn't convert the separated track to mp3: {_tail_error(convert.stderr)}")
 
     title_result = subprocess.run(
-        ["yt-dlp", "--get-title", "--no-playlist", *YT_DLP_EXTRA_ARGS, youtube_url],
+        ["yt-dlp", "--get-title", "--no-playlist", *yt_dlp_args, youtube_url],
         capture_output=True,
         text=True,
     )

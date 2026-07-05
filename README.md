@@ -60,6 +60,45 @@ edit in browser → commit to this branch), swap in another model name with
 "Karaoke" in it, and re-run the workflow. `PLAN.md` has more detail on
 picking one.
 
+## 1b. Give it YouTube cookies (needed for reliable downloads)
+
+YouTube blocks anonymous requests from cloud servers like Modal's with
+`Sign in to confirm you're not a bot` / `LOGIN_REQUIRED`. The only real
+fix is passing yt-dlp cookies from an actual logged-in browser session.
+This part needs *some* non-iPad browser once (a library computer, a
+friend's laptop, anything — it doesn't need to be a device you own) since
+iPad Safari can't export these particular cookies. Everything else below
+is iPad-friendly.
+
+**Recommended:** use a spare/throwaway Google account for this rather
+than your main one — it's the account whose session gets used for every
+download, and there's some chance of it getting rate-limited or flagged.
+
+1. On a desktop browser (Chrome, Firefox, or Edge), install a cookie
+   export extension — search the browser's extension store for
+   **"Get cookies.txt LOCALLY"** (a well-known, widely used one).
+2. Go to **youtube.com**, sign in with the account you're using for this.
+3. Click the extension's icon → export/download cookies for
+   `youtube.com`. You get a `cookies.txt` file.
+4. Open that file in a text editor, select all, copy it.
+5. Back on your iPad (or wherever): go to **modal.com** → your workspace
+   dashboard → **Secrets** → **New Secret**.
+6. Create a secret named exactly `youtube-cookies` with one key:
+   - Key: `COOKIES_TXT`
+   - Value: paste the entire contents of the cookies.txt file
+7. Save it.
+8. Re-run the "Deploy Modal backend" GitHub Action (same as step 4 in
+   section 1 above) so the app picks up the secret.
+
+**When downloads start failing again after a while:** cookies expire
+(usually after weeks to months). Repeat steps 1-7 with a fresh export —
+same secret name, it just overwrites the old value.
+
+**If you skip this step entirely:** the app still runs, but yt-dlp will
+likely hit YouTube's bot-check on most real songs and show a clear error
+saying so — nothing crashes, downloads just won't reliably work until
+cookies are added.
+
 ## 2. Deploy the frontend to Vercel
 
 All web UI, no terminal needed either way:
