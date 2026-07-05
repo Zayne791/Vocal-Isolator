@@ -75,10 +75,14 @@ image = (
 # yt-dlp's default clients here (android_vr, web_safari) returned
 # LOGIN_REQUIRED even with valid cookies attached, which points to them
 # not actually being cookie-aware; "web" is the client cookies are
-# actually designed for.
+# actually designed for. --remote-components ejs:github lets yt-dlp fetch
+# the challenge-solver script "web" needs for YouTube's SABR streaming -
+# without it, cookies authenticate fine but zero formats come back.
 YT_DLP_EXTRA_ARGS = [
     "--js-runtimes",
     "deno",
+    "--remote-components",
+    "ejs:github",
     "--extractor-args",
     "youtube:formats=missing_pot;player_client=web",
 ]
