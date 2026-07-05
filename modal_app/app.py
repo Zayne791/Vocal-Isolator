@@ -22,15 +22,70 @@ KARAOKE_MODEL = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
 
 app = modal.App("neville-song-stripper")
 
+BGUTIL_PROVIDER_DIR = "/opt/bgutil-provider/server"
+BGUTIL_PROVIDER_PORT = 4416
+
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")
+    .apt_install("ffmpeg", "curl", "unzip", "git")
+    # Native build deps for the bgutil provider server's "canvas" dependency.
+    .apt_install(
+        "build-essential",
+        "pkg-config",
+        "libcairo2-dev",
+        "libpango1.0-dev",
+        "libjpeg-dev",
+        "libgif-dev",
+        "librsvg2-dev",
+    )
+    # bgutil's server needs Node >=20; Debian's own package is often older.
+    .run_commands(
+        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
+        "apt-get install -y nodejs",
+    )
     .pip_install(
         "yt-dlp",
         "audio-separator[cpu]",
         "fastapi[standard]",
+        "bgutil-ytdlp-pot-provider",
     )
+    # A "PO token provider" - mints the proof-of-origin token YouTube now
+    # requires before it'll hand over real download URLs to automated
+    # clients. Without this, cloud-IP requests get rejected outright with
+    # "Sign in to confirm you're not a bot" regardless of the video. Runs
+    # as a small local HTTP server (see SongStripper.start_pot_provider
+    # below); yt-dlp's plugin auto-detects it on the default port, no
+    # extra flags needed. See PLAN.md for why this exists instead of
+    # cookies. Pinned to a tag rather than main so an upstream change
+    # can't silently break builds.
+    .run_commands(
+        f"git clone --single-branch --branch 1.3.1 "
+        f"https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-provider",
+        f"cd {BGUTIL_PROVIDER_DIR} && npm ci && npx tsc",
+    )
+    # yt-dlp increasingly needs a JS runtime to solve YouTube's playback
+    # challenges - deno is the one it looks for by default. Separate from
+    # the PO token issue above, but a real failure mode worth closing off.
+    .run_commands("curl -fsSL https://deno.land/install.sh | sh -s -- -y")
+    .env({"PATH": "/root/.deno/bin:$PATH"})
 )
+
+# Extra yt-dlp flags: use the JS runtime above, don't hard-fail just
+# because a PO token couldn't be minted, and force the "web" client -
+# yt-dlp's default clients here (android_vr, web_safari) returned
+# LOGIN_REQUIRED even with valid cookies attached, which points to them
+# not actually being cookie-aware; "web" is the client cookies are
+# actually designed for. --remote-components ejs:github lets yt-dlp fetch
+# the challenge-solver script "web" needs for YouTube's SABR streaming -
+# without it, cookies authenticate fine but zero formats come back.
+YT_DLP_EXTRA_ARGS = [
+    "--js-runtimes",
+    "deno",
+    "--remote-components",
+    "ejs:github",
+    "--extractor-args",
+    "youtube:formats=missing_pot;player_client=web",
+]
 
 # Modal spins up a fresh container per call - without this, every single
 # song would re-download the ~1-2GB separation model from scratch. This
@@ -39,32 +94,107 @@ image = (
 model_cache = modal.Volume.from_name("neville-song-stripper-models", create_if_missing=True)
 MODEL_CACHE_DIR = "/cache/audio-separator-models"
 
+# PO tokens alone weren't enough - YouTube returned LOGIN_REQUIRED for
+# Modal's IPs regardless (see PLAN.md). A cookies.txt from a real signed-in
+# session, stored as a Modal Secret (never in this repo), is the actual
+# fix. Create it via the Modal dashboard: Secrets -> New Secret -> key
+# COOKIES_TXT, value = the full contents of an exported cookies.txt file.
+COOKIES_SECRET_NAME = "youtube-cookies"
 
-@app.function(
+
+def _tail_error(text: str) -> str:
+    """Pull the most useful line out of a CLI tool's stderr for the UI."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    error_lines = [line for line in lines if line.upper().startswith("ERROR")]
+    if error_lines:
+        return error_lines[-1]
+    return lines[-1] if lines else "no error output"
+
+
+@app.cls(
     image=image,
     timeout=900,
     cpu=4,
     memory=4096,
     volumes={"/cache": model_cache},
+    secrets=[modal.Secret.from_name(COOKIES_SECRET_NAME)],
 )
-def run_pipeline(youtube_url: str) -> dict:
+class SongStripper:
+    @modal.enter()
+    def start_pot_provider(self):
+        import socket
+        import subprocess
+        import time
+
+        self._pot_process = subprocess.Popen(
+            ["node", "build/main.js", "--port", str(BGUTIL_PROVIDER_PORT)],
+            cwd=BGUTIL_PROVIDER_DIR,
+        )
+        for _ in range(30):
+            try:
+                with socket.create_connection(("127.0.0.1", BGUTIL_PROVIDER_PORT), timeout=1):
+                    return
+            except OSError:
+                time.sleep(1)
+        raise RuntimeError("PO token provider server didn't come up in time.")
+
+    @modal.method()
+    def run(self, youtube_url: str) -> dict:
+        return _run_pipeline(youtube_url)
+
+
+def _run_pipeline(youtube_url: str) -> dict:
     import glob
     import os
     import subprocess
+    import sys
     import tempfile
 
     from audio_separator.separator import Separator
 
+    def log(message: str) -> None:
+        # Shows up in `modal app logs neville-song-stripper` and the Modal
+        # dashboard's Logs tab for this app.
+        print(f"[{youtube_url}] {message}", flush=True, file=sys.stderr)
+
     work_dir = tempfile.mkdtemp()
     input_template = os.path.join(work_dir, "input.%(ext)s")
 
+    yt_dlp_args = list(YT_DLP_EXTRA_ARGS)
+    cookies_content = os.environ.get("COOKIES_TXT")
+    if cookies_content:
+        cookies_path = os.path.join(work_dir, "cookies.txt")
+        with open(cookies_path, "w") as f:
+            f.write(cookies_content)
+        yt_dlp_args += ["--cookies", cookies_path]
+
+        # Diagnostic only - names, never values, so nothing sensitive is
+        # logged. Checks the file actually has the auth cookies YouTube
+        # needs, not just a valid-looking but incomplete/wrong export.
+        cookie_lines = [
+            line for line in cookies_content.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        cookie_names = [line.split("\t")[5] for line in cookie_lines if line.count("\t") >= 5]
+        required = {"SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-3PAPISID", "__Secure-1PSID"}
+        found_required = required & set(cookie_names)
+        log(
+            f"Using cookies from the youtube-cookies Modal secret "
+            f"({len(cookie_lines)} cookie lines, auth cookies present: {sorted(found_required) or 'NONE'})"
+        )
+    else:
+        log("No COOKIES_TXT secret value found - proceeding without cookies")
+
+    log("Starting yt-dlp download")
     download = subprocess.run(
         [
             "yt-dlp",
+            "-v",
             "-x",
             "--audio-format",
             "wav",
             "--no-playlist",
+            *yt_dlp_args,
             "-o",
             input_template,
             youtube_url,
@@ -72,21 +202,33 @@ def run_pipeline(youtube_url: str) -> dict:
         capture_output=True,
         text=True,
     )
+    log(f"yt-dlp exited {download.returncode}")
+    # Full output, not just the tail - with -v, the PO-token-provider debug
+    # lines that matter most for diagnosing failures are near the *start*.
+    if download.stdout:
+        log(f"yt-dlp stdout:\n{download.stdout}")
+    if download.stderr:
+        log(f"yt-dlp stderr:\n{download.stderr}")
+
     if download.returncode != 0:
         raise RuntimeError(
-            "Couldn't download audio from that link. Double check it's a "
-            "regular YouTube video link, not a private or age-restricted one."
+            "Couldn't download audio from that link. "
+            f"yt-dlp said: {_tail_error(download.stderr)}"
         )
 
     input_matches = glob.glob(os.path.join(work_dir, "input.*"))
     if not input_matches:
         raise RuntimeError("Couldn't find a downloaded audio file for that link.")
     input_path = input_matches[0]
+    log(f"Downloaded {input_path}")
 
+    log(f"Loading separation model {KARAOKE_MODEL}")
     separator = Separator(output_dir=work_dir, model_file_dir=MODEL_CACHE_DIR)
     separator.load_model(model_filename=KARAOKE_MODEL)
     model_cache.commit()
+    log("Running separation")
     output_files = separator.separate(input_path)
+    log(f"Separation produced: {output_files}")
 
     instrumental_path = next(
         (
@@ -100,6 +242,7 @@ def run_pipeline(youtube_url: str) -> dict:
         raise RuntimeError("Separation finished, but no instrumental track came out of it.")
 
     mp3_path = os.path.join(work_dir, "output.mp3")
+    log("Converting to mp3")
     convert = subprocess.run(
         [
             "ffmpeg",
@@ -116,10 +259,11 @@ def run_pipeline(youtube_url: str) -> dict:
         text=True,
     )
     if convert.returncode != 0:
-        raise RuntimeError("Couldn't convert the separated track to mp3.")
+        log(f"ffmpeg stderr tail:\n{convert.stderr[-2000:]}")
+        raise RuntimeError(f"Couldn't convert the separated track to mp3: {_tail_error(convert.stderr)}")
 
     title_result = subprocess.run(
-        ["yt-dlp", "--get-title", "--no-playlist", youtube_url],
+        ["yt-dlp", "--get-title", "--no-playlist", *yt_dlp_args, youtube_url],
         capture_output=True,
         text=True,
     )
@@ -128,6 +272,7 @@ def run_pipeline(youtube_url: str) -> dict:
     with open(mp3_path, "rb") as f:
         audio_bytes = f.read()
 
+    log("Done")
     return {
         "filename": f"{title} (no lead vocal).mp3",
         "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
@@ -156,7 +301,7 @@ def web():
         if not youtube_url:
             return JSONResponse({"error": "Paste a YouTube link first."}, status_code=400)
 
-        call = run_pipeline.spawn(youtube_url)
+        call = SongStripper().run.spawn(youtube_url)
         return {"call_id": call.object_id}
 
     @web_app.get("/status")

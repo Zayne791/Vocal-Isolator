@@ -43,6 +43,45 @@ the same line.
 - **Access.** Unlisted link only, no PIN (your call). Worth revisiting if
   the link ever gets shared beyond the household.
 
+## Known limitation: YouTube blocking cloud IPs
+
+yt-dlp downloads sometimes fail (`Video unavailable`, `403 Forbidden`,
+`LOGIN_REQUIRED`) regardless of the specific song or video — this is
+YouTube's anti-bot system flagging Modal's (or any cloud provider's) IP
+address, not a bug in this app. Confirmed by testing multiple unrelated
+videos and every internal yt-dlp "client" mode identically.
+
+Two mitigations are layered in, in the order they were tried:
+
+1. **A JS runtime (deno)** — yt-dlp increasingly needs one to solve
+   YouTube's playback challenges. Necessary but not sufficient on its own.
+2. **A PO token provider** (`bgutil-ytdlp-pot-provider`, runs as a local
+   HTTP server started once per container via `@modal.enter()`) — mints
+   the proof-of-origin token automated clients now need. Confirmed
+   working (registers as an available provider), but on its own it
+   doesn't clear everything: YouTube returned `LOGIN_REQUIRED` for
+   Modal's IPs even with a valid token, since that status specifically
+   demands a real signed-in session, a different check than what PO
+   tokens answer.
+3. **Cookies from a real, logged-in browser session** — the actual fix
+   for `LOGIN_REQUIRED`. Passed via `--cookies`, sourced from a Modal
+   Secret named `youtube-cookies` (key `COOKIES_TXT`, value = the full
+   contents of an exported cookies.txt) — never committed to this repo.
+   Falls back to running without cookies if the secret's value is empty,
+   so a missing/expired cookie file degrades rather than breaking the
+   whole app.
+
+Cookies expire/rotate over time (weeks to months) and need re-exporting
+and re-pasting into the Modal Secret when that happens — see README.md
+for the exact steps. Use a secondary/throwaway Google account for this
+rather than a primary one, since automated use carries some risk of the
+account itself getting flagged.
+
+Check `modal app logs neville-song-stripper` (or the Logs tab in Modal's
+dashboard) for the real yt-dlp/ffmpeg verbose output on any failure —
+every stage of the pipeline logs there now, including whether cookies
+were actually used for that request.
+
 ## Legal/ethical note
 
 Downloading YouTube audio for personal, non-shared use is common
