@@ -2,9 +2,12 @@
 
 ## What it does
 
-Upload a song file, tap one button, get an MP3 back with the lead vocal
-removed and everything else — instruments and backing/harmony vocals —
-left intact.
+Upload a song file, tap one button to separate it, then use a slider to
+put the lead vocal wherever you want it — fully removed, back at its
+original level, or boosted above that — with everything else
+(instruments, backing/harmony vocals) left intact. The mix previews live
+in the browser as the slider moves; downloading renders a WAV of
+whatever level it's on.
 
 ## History: this used to work off a pasted YouTube link
 
@@ -60,16 +63,26 @@ the same line.
   one button, one download link at a time. No accounts, no settings menu.
 - **Backend — Modal.** A Python serverless app (`modal_app/app.py`) that
   takes an uploaded file straight to UVR karaoke separation → `ffmpeg`
-  mp3, exposed over HTTP. Modal scales to zero between requests — no idle
-  server bill — and gives ~$30/month free credit, which comfortably covers
-  one household's occasional use. **Vercel alone can't run this part**:
-  its serverless functions can't hold multi-GB ML model files, run
-  PyTorch/ONNX inference, or run for the several minutes separation takes.
-  Splitting frontend (Vercel) from heavy compute (Modal) is what makes
-  "cheap cheap cheap" and "runs on Vercel" both true at once. This is now
-  a genuinely simple image — just `ffmpeg` + the separation library, no
-  Node, no browser automation, no secrets to manage.
-- **Delivery.** Plain MP3 download link — no Google Drive API integration.
+  mp3, exposed over HTTP. It returns *both* stems (the lead vocal, and
+  everything else) as separate mp3s rather than one pre-mixed result, so
+  the frontend can remix them at any vocal level. Modal scales to zero
+  between requests — no idle server bill — and gives ~$30/month free
+  credit, which comfortably covers one household's occasional use.
+  **Vercel alone can't run this part**: its serverless functions can't
+  hold multi-GB ML model files, run PyTorch/ONNX inference, or run for
+  the several minutes separation takes. Splitting frontend (Vercel) from
+  heavy compute (Modal) is what makes "cheap cheap cheap" and "runs on
+  Vercel" both true at once. This is now a genuinely simple image — just
+  `ffmpeg` + the separation library, no Node, no browser automation, no
+  secrets to manage.
+- **Vocal-level slider.** The frontend decodes both stems with the Web
+  Audio API and plays them back through two synced sources — the
+  instrumental at a fixed gain, the vocal through a `GainNode` the slider
+  drives live. No extra network round-trip per slider move. Downloading
+  renders that same mix offline and hands back a WAV — a plain PCM
+  encoder is a few lines of code, so no third-party mp3-encoder
+  dependency is needed client-side.
+- **Delivery.** Plain WAV download link — no Google Drive API integration.
   Tapping download on Android/ChromeOS already offers "Save to Drive" from
   the native share sheet, with zero OAuth setup, zero token-expiry
   surprises for Neville.

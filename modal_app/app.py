@@ -1,9 +1,10 @@
 """
 Neville's Song Stripper - separation pipeline, deployed on Modal.
 
-Flow: an audio file is uploaded -> a UVR karaoke-style model splits out
-the lead vocal -> what's left (instrumental + backing vocals) is
-converted to mp3 and handed back.
+Flow: an audio file is uploaded -> a UVR karaoke-style model splits it
+into two stems (the lead vocal, and everything else - instrumental +
+backing vocals) -> both stems are converted to mp3 and handed back so
+the frontend can remix them at any vocal level, not just fully removed.
 
 Deploy with:  modal deploy modal_app/app.py
 """
@@ -100,47 +101,56 @@ def run_pipeline(audio_bytes: bytes, original_filename: str) -> dict:
     output_files = separator.separate(input_path)
     log(f"Separation produced: {output_files}")
 
-    instrumental_path = next(
-        (
-            os.path.join(work_dir, name)
-            for name in output_files
-            if "instrumental" in name.lower()
-        ),
-        None,
-    )
-    if instrumental_path is None:
-        raise RuntimeError("Separation finished, but no instrumental track came out of it.")
+    def find_stem(keyword: str) -> str:
+        path = next(
+            (
+                os.path.join(work_dir, name)
+                for name in output_files
+                if keyword in name.lower()
+            ),
+            None,
+        )
+        if path is None:
+            raise RuntimeError(f"Separation finished, but no {keyword} track came out of it.")
+        return path
 
-    mp3_path = os.path.join(work_dir, "output.mp3")
-    log("Converting to mp3")
-    convert = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            instrumental_path,
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            mp3_path,
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if convert.returncode != 0:
-        log(f"ffmpeg stderr:\n{convert.stderr}")
-        raise RuntimeError(f"Couldn't convert the separated track to mp3: {_tail_error(convert.stderr)}")
+    instrumental_path = find_stem("instrumental")
+    vocals_path = find_stem("vocals")
+
+    def to_mp3(source_path: str, out_name: str) -> bytes:
+        out_path = os.path.join(work_dir, out_name)
+        log(f"Converting {out_name} to mp3")
+        convert = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                source_path,
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                out_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if convert.returncode != 0:
+            log(f"ffmpeg stderr:\n{convert.stderr}")
+            raise RuntimeError(f"Couldn't convert the separated track to mp3: {_tail_error(convert.stderr)}")
+        with open(out_path, "rb") as f:
+            return f.read()
+
+    instrumental_bytes = to_mp3(instrumental_path, "instrumental.mp3")
+    vocals_bytes = to_mp3(vocals_path, "vocals.mp3")
 
     title = os.path.splitext(original_filename)[0] or "song"
 
-    with open(mp3_path, "rb") as f:
-        audio_bytes_out = f.read()
-
     log("Done")
     return {
-        "filename": f"{title} (no lead vocal).mp3",
-        "audio_base64": base64.b64encode(audio_bytes_out).decode("ascii"),
+        "title": title,
+        "instrumental_base64": base64.b64encode(instrumental_bytes).decode("ascii"),
+        "vocals_base64": base64.b64encode(vocals_bytes).decode("ascii"),
     }
 
 

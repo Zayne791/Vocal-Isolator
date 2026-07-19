@@ -1,7 +1,9 @@
 # Neville's Song Stripper
 
-Upload a song file, get an MP3 back with the lead vocal removed and
-everything else — instruments, backing/harmony vocals — intact.
+Upload a song file, then dial the lead vocal up or down with a slider —
+from fully removed to back at its original level (or boosted) — and
+download the mix you land on. Everything else — instruments,
+backing/harmony vocals — stays intact throughout.
 
 See `PLAN.md` for the full architecture writeup (including why this is
 upload-based rather than a pasted YouTube link — short version: YouTube
@@ -74,9 +76,13 @@ from the browser, so there's nothing else to wire up.
 ## 3. Try it
 
 Open the Vercel URL, tap **Tap to choose a file**, pick a song file
-already on the device, tap **Remove the singer**, wait, tap **Download
-MP3**. On Android/ChromeOS the share sheet on that download already
-offers "Save to Drive" — no extra setup needed for that part.
+already on the device, tap **Remove the singer**, and wait. Once it's
+done, drag the **Vocals** slider to taste — 0% is fully removed, 100% is
+the original level, up to 150% boosts it above original — previewing
+live with the play button, then tap **Download this mix** to save a WAV
+of whatever level the slider is on. On Android/ChromeOS the share sheet
+on that download already offers "Save to Drive" — no extra setup needed
+for that part.
 
 ## Cost expectations
 
