@@ -3,8 +3,10 @@ name: Deploy Modal backend
 on:
   workflow_dispatch: {}
   push:
-    branches:
-      - claude/neville-vocal-removal-site-g6luhi
+    # No branch filter: work on this repo happens on a fresh
+    # claude/<task-name> branch each time, so pinning this to one
+    # hardcoded branch name silently stops auto-deploying the moment work
+    # moves to the next branch (as happened here).
     paths:
       - "modal_app/**"
       - ".github/workflows/deploy-modal.yml"
