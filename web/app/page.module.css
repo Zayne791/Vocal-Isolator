@@ -218,12 +218,23 @@
   text-align: left;
 }
 
-.trackArt {
+.playButton {
   width: 40px;
   height: 40px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, var(--accent-dim), #0a2b1c);
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: none;
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.playButton:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
 }
 
 .trackMeta {
@@ -244,18 +255,61 @@
   color: var(--text-faint);
 }
 
-.downloadLink {
+.sliderBlock {
   width: 100%;
-  display: block;
-  text-align: center;
-  background: var(--accent);
-  color: var(--accent-ink);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sliderLabelRow {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 8px;
   border-radius: 999px;
-  padding: 20px 22px;
-  font-size: 17px;
-  font-weight: 800;
-  text-decoration: none;
-  box-shadow:
-    0 0 0 1px rgba(60, 242, 143, 0.4),
-    0 14px 30px -12px rgba(60, 242, 143, 0.55);
+  background: linear-gradient(
+    90deg,
+    var(--accent-dim) 0%,
+    var(--accent) 66.6%,
+    var(--danger) 100%
+  );
+  outline: none;
+  cursor: pointer;
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--text);
+  border: 3px solid var(--accent-ink);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+
+.slider::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--text);
+  border: 3px solid var(--accent-ink);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+}
+
+.slider:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 3px;
 }

@@ -1,6 +1,7 @@
 # Neville's Song Stripper — frontend
 
-The one-page UI: paste a link, tap a button, download the mp3.
+The one-page UI: upload a file, drag the vocal-level slider, download
+the mix.
 
 For the full setup (deploying this to Vercel and wiring it to the Modal
 backend), see the `README.md` at the repo root.
