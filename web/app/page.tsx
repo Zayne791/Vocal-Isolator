@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import styles from "./page.module.css";
 
 const API_BASE = process.env.NEXT_PUBLIC_STRIPPER_API_URL;
@@ -21,12 +21,16 @@ const MIN_VOCAL_LEVEL = 0;
 const MAX_VOCAL_LEVEL = 150;
 const DEFAULT_VOCAL_LEVEL = 0;
 
+// If the two stems ever drift out of sync by more than this (independent
+// <audio> elements aren't sample-locked), snap the vocal track back.
+const MAX_DRIFT_SECONDS = 0.2;
+
 type Phase = "idle" | "working" | "done" | "error";
 
 type Stems = {
   title: string;
-  instrumentalBuffer: AudioBuffer;
-  vocalsBuffer: AudioBuffer;
+  instrumentalUrl: string;
+  vocalsUrl: string;
 };
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
@@ -36,6 +40,10 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes.buffer;
+}
+
+function base64ToBlobUrl(base64: string, mimeType: string): string {
+  return URL.createObjectURL(new Blob([base64ToArrayBuffer(base64)], { type: mimeType }));
 }
 
 function formatTime(seconds: number): string {
@@ -99,6 +107,7 @@ export default function Home() {
   const [vocalLevel, setVocalLevel] = useState(DEFAULT_VOCAL_LEVEL);
   const [isPlaying, setIsPlaying] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [duration, setDuration] = useState(0);
   const [isRendering, setIsRendering] = useState(false);
 
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -106,13 +115,9 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const instrumentalSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const vocalsSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const instrumentalAudioRef = useRef<HTMLAudioElement | null>(null);
+  const vocalsAudioRef = useRef<HTMLAudioElement | null>(null);
   const vocalGainRef = useRef<GainNode | null>(null);
-  const playStartCtxTimeRef = useRef(0);
-  const playOffsetRef = useRef(0);
-  const playTokenRef = useRef(0);
-  const rafRef = useRef<number | null>(null);
 
   function getAudioContext(): AudioContext {
     if (!audioCtxRef.current) {
@@ -121,118 +126,72 @@ export default function Home() {
     return audioCtxRef.current;
   }
 
-  function stopSources() {
-    try {
-      instrumentalSourceRef.current?.stop();
-    } catch {
-      // already stopped/ended - fine
-    }
-    try {
-      vocalsSourceRef.current?.stop();
-    } catch {
-      // already stopped/ended - fine
-    }
-    instrumentalSourceRef.current = null;
-    vocalsSourceRef.current = null;
-  }
-
-  const startPlayback = useCallback(
-    (offset: number, current: Stems) => {
-      const ctx = getAudioContext();
-      const myToken = ++playTokenRef.current;
-      stopSources();
-
-      const instrumentalSource = ctx.createBufferSource();
-      instrumentalSource.buffer = current.instrumentalBuffer;
-      instrumentalSource.connect(ctx.destination);
-
-      const vocalsSource = ctx.createBufferSource();
-      vocalsSource.buffer = current.vocalsBuffer;
-      const gainNode = ctx.createGain();
-      gainNode.gain.value = vocalLevel / 100;
-      vocalsSource.connect(gainNode).connect(ctx.destination);
-
-      instrumentalSource.onended = () => {
-        if (playTokenRef.current !== myToken) return; // superseded by a later play/pause
-        setIsPlaying(false);
-        setElapsed(0);
-        playOffsetRef.current = 0;
-      };
-
-      instrumentalSource.start(0, offset);
-      vocalsSource.start(0, offset);
-
-      instrumentalSourceRef.current = instrumentalSource;
-      vocalsSourceRef.current = vocalsSource;
-      vocalGainRef.current = gainNode;
-      playStartCtxTimeRef.current = ctx.currentTime;
-      playOffsetRef.current = offset;
-      setIsPlaying(true);
-    },
-    [vocalLevel]
-  );
-
-  function pausePlayback() {
-    if (!audioCtxRef.current) return;
-    const ctx = audioCtxRef.current;
-    const duration = stems?.instrumentalBuffer.duration ?? 0;
-    const elapsedNow = Math.min(
-      playOffsetRef.current + (ctx.currentTime - playStartCtxTimeRef.current),
-      duration
-    );
-    playTokenRef.current++; // invalidate the pending onended from the current sources
-    stopSources();
-    playOffsetRef.current = elapsedNow;
-    setElapsed(elapsedNow);
-    setIsPlaying(false);
-  }
-
-  function togglePlay() {
-    if (!stems) return;
-    if (isPlaying) {
-      pausePlayback();
-      return;
-    }
-    const ctx = getAudioContext();
-    if (ctx.state === "suspended") ctx.resume();
-    const duration = stems.instrumentalBuffer.duration;
-    const startOffset = playOffsetRef.current >= duration - 0.05 ? 0 : playOffsetRef.current;
-    startPlayback(startOffset, stems);
-  }
-
-  function handleVocalLevelChange(value: number) {
-    setVocalLevel(value);
-    if (vocalGainRef.current) {
-      vocalGainRef.current.gain.value = value / 100;
-    }
-  }
-
-  // Live progress readout while playing.
+  // Build the playback graph as native <audio> elements (fast, streamed,
+  // handled by the browser's own robust media pipeline) routed through
+  // Web Audio only so the vocal track's volume can be driven live by the
+  // slider - including boosting past 100%, which <audio>.volume can't do.
   useEffect(() => {
-    if (!isPlaying) {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      return;
-    }
+    if (!stems) return;
+
     const ctx = getAudioContext();
-    const duration = stems?.instrumentalBuffer.duration ?? 0;
-    const tick = () => {
-      const now = playOffsetRef.current + (ctx.currentTime - playStartCtxTimeRef.current);
-      setElapsed(Math.min(now, duration));
-      rafRef.current = requestAnimationFrame(tick);
+
+    const instrumentalEl = new Audio(stems.instrumentalUrl);
+    instrumentalEl.preload = "auto";
+
+    const vocalsEl = new Audio(stems.vocalsUrl);
+    vocalsEl.preload = "auto";
+
+    const instrumentalSource = ctx.createMediaElementSource(instrumentalEl);
+    instrumentalSource.connect(ctx.destination);
+
+    const vocalsSource = ctx.createMediaElementSource(vocalsEl);
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = DEFAULT_VOCAL_LEVEL / 100;
+    vocalsSource.connect(gainNode).connect(ctx.destination);
+
+    const handleLoadedMetadata = () => setDuration(instrumentalEl.duration || 0);
+    const handleTimeUpdate = () => {
+      setElapsed(instrumentalEl.currentTime);
+      if (Math.abs(vocalsEl.currentTime - instrumentalEl.currentTime) > MAX_DRIFT_SECONDS) {
+        vocalsEl.currentTime = instrumentalEl.currentTime;
+      }
     };
-    rafRef.current = requestAnimationFrame(tick);
+    const handleEnded = () => {
+      setIsPlaying(false);
+      setElapsed(0);
+      vocalsEl.pause();
+      vocalsEl.currentTime = 0;
+    };
+
+    instrumentalEl.addEventListener("loadedmetadata", handleLoadedMetadata);
+    instrumentalEl.addEventListener("timeupdate", handleTimeUpdate);
+    instrumentalEl.addEventListener("ended", handleEnded);
+
+    instrumentalAudioRef.current = instrumentalEl;
+    vocalsAudioRef.current = vocalsEl;
+    vocalGainRef.current = gainNode;
+
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      instrumentalEl.pause();
+      vocalsEl.pause();
+      instrumentalEl.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      instrumentalEl.removeEventListener("timeupdate", handleTimeUpdate);
+      instrumentalEl.removeEventListener("ended", handleEnded);
+      instrumentalSource.disconnect();
+      vocalsSource.disconnect();
+      gainNode.disconnect();
+      URL.revokeObjectURL(stems.instrumentalUrl);
+      URL.revokeObjectURL(stems.vocalsUrl);
+      instrumentalAudioRef.current = null;
+      vocalsAudioRef.current = null;
+      vocalGainRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying]);
+  }, [stems]);
 
   useEffect(() => {
     return () => {
       if (pollTimer.current) clearTimeout(pollTimer.current);
       if (phraseTimer.current) clearInterval(phraseTimer.current);
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      stopSources();
       audioCtxRef.current?.close();
     };
   }, []);
@@ -242,17 +201,48 @@ export default function Home() {
     if (phraseTimer.current) clearInterval(phraseTimer.current);
   }
 
+  function togglePlay() {
+    const instrumentalEl = instrumentalAudioRef.current;
+    const vocalsEl = vocalsAudioRef.current;
+    if (!instrumentalEl || !vocalsEl) return;
+
+    if (isPlaying) {
+      instrumentalEl.pause();
+      vocalsEl.pause();
+      setIsPlaying(false);
+      return;
+    }
+
+    const ctx = getAudioContext();
+    if (ctx.state === "suspended") ctx.resume();
+
+    if (instrumentalEl.ended) {
+      instrumentalEl.currentTime = 0;
+      vocalsEl.currentTime = 0;
+    }
+    vocalsEl.currentTime = instrumentalEl.currentTime;
+
+    Promise.all([instrumentalEl.play(), vocalsEl.play()])
+      .then(() => setIsPlaying(true))
+      .catch(() => setError("Couldn't start playback. Please try again."));
+  }
+
+  function handleVocalLevelChange(value: number) {
+    setVocalLevel(value);
+    if (vocalGainRef.current) {
+      vocalGainRef.current.gain.value = value / 100;
+    }
+  }
+
   function resetToIdle() {
     stopTimers();
-    stopSources();
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     setPhase("idle");
     setFile(null);
     setStems(null);
     setVocalLevel(DEFAULT_VOCAL_LEVEL);
     setIsPlaying(false);
     setElapsed(0);
-    playOffsetRef.current = 0;
+    setDuration(0);
     setError("");
     setProgress(8);
     setPhraseIndex(0);
@@ -261,17 +251,29 @@ export default function Home() {
   async function handleDownload() {
     if (!stems) return;
     setIsRendering(true);
+    setError("");
     try {
-      const length = Math.max(stems.instrumentalBuffer.length, stems.vocalsBuffer.length);
-      const offlineCtx = new OfflineAudioContext(2, length, stems.instrumentalBuffer.sampleRate);
+      const ctx = getAudioContext();
+      const decodeStem = async (url: string) => {
+        const response = await fetch(url);
+        const arrayBuffer = await response.arrayBuffer();
+        return ctx.decodeAudioData(arrayBuffer);
+      };
+      const [instrumentalBuffer, vocalsBuffer] = await Promise.all([
+        decodeStem(stems.instrumentalUrl),
+        decodeStem(stems.vocalsUrl),
+      ]);
+
+      const length = Math.max(instrumentalBuffer.length, vocalsBuffer.length);
+      const offlineCtx = new OfflineAudioContext(2, length, instrumentalBuffer.sampleRate);
 
       const instrumentalSource = offlineCtx.createBufferSource();
-      instrumentalSource.buffer = stems.instrumentalBuffer;
+      instrumentalSource.buffer = instrumentalBuffer;
       instrumentalSource.connect(offlineCtx.destination);
       instrumentalSource.start(0);
 
       const vocalsSource = offlineCtx.createBufferSource();
-      vocalsSource.buffer = stems.vocalsBuffer;
+      vocalsSource.buffer = vocalsBuffer;
       const gainNode = offlineCtx.createGain();
       gainNode.gain.value = vocalLevel / 100;
       vocalsSource.connect(gainNode).connect(offlineCtx.destination);
@@ -364,27 +366,16 @@ export default function Home() {
 
           stopTimers();
           setProgress(100);
-
-          try {
-            const ctx = getAudioContext();
-            const [instrumentalBuffer, vocalsBuffer] = await Promise.all([
-              ctx.decodeAudioData(base64ToArrayBuffer(statusBody.instrumental_base64)),
-              ctx.decodeAudioData(base64ToArrayBuffer(statusBody.vocals_base64)),
-            ]);
-            playOffsetRef.current = 0;
-            setElapsed(0);
-            setIsPlaying(false);
-            setVocalLevel(DEFAULT_VOCAL_LEVEL);
-            setStems({
-              title: statusBody.title || "song",
-              instrumentalBuffer,
-              vocalsBuffer,
-            });
-            setPhase("done");
-          } catch {
-            setPhase("error");
-            setError("Got the separated tracks back, but couldn't load them for playback. Please try again.");
-          }
+          setElapsed(0);
+          setDuration(0);
+          setIsPlaying(false);
+          setVocalLevel(DEFAULT_VOCAL_LEVEL);
+          setStems({
+            title: statusBody.title || "song",
+            instrumentalUrl: base64ToBlobUrl(statusBody.instrumental_base64, "audio/mpeg"),
+            vocalsUrl: base64ToBlobUrl(statusBody.vocals_base64, "audio/mpeg"),
+          });
+          setPhase("done");
         } catch {
           // A single stalled request (flaky connection, backgrounded tab)
           // shouldn't kill the whole job - only give up after several in a row.
@@ -409,8 +400,6 @@ export default function Home() {
       setError(err instanceof Error ? err.message : "Something went wrong. Please try again.");
     }
   }
-
-  const duration = stems?.instrumentalBuffer.duration ?? 0;
 
   return (
     <main className={styles.page}>
