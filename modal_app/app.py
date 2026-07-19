@@ -129,7 +129,7 @@ def run_pipeline(audio_bytes: bytes, original_filename: str) -> dict:
                 "-codec:a",
                 "libmp3lame",
                 "-b:a",
-                "192k",
+                "128k",
                 out_path,
             ],
             capture_output=True,

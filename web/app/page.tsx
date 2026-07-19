@@ -12,7 +12,11 @@ const WORKING_PHRASES = [
 ];
 
 const POLL_INTERVAL_MS = 3000;
-const POLL_TIMEOUT_MS = 15000;
+// Generous on purpose: unlike the tiny {"state":"pending"} polls, the
+// final poll's response carries two full mp3 stems as base64, which can
+// take a while to download on a slow connection. A too-short timeout here
+// aborts that download mid-flight and forces a full retry from scratch.
+const POLL_TIMEOUT_MS = 60000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
 // 0% = fully removed (this app's original default), 100% = the singer
@@ -344,41 +348,16 @@ export default function Home() {
         const controller = new AbortController();
         const abortTimer = setTimeout(() => controller.abort(), POLL_TIMEOUT_MS);
 
+        // Network I/O only in here - failures here are transient (flaky
+        // connection, backgrounded tab) and worth retrying a few times.
+        let statusBody: Record<string, unknown>;
         try {
           const statusResponse = await fetch(`${API_BASE}/status?call_id=${call_id}`, {
             signal: controller.signal,
           });
-          const statusBody = await statusResponse.json();
+          statusBody = await statusResponse.json();
           consecutiveFailures = 0;
-
-          if (statusBody.state === "pending") {
-            setProgress((p) => Math.min(p + 4, 92));
-            pollTimer.current = setTimeout(pollStatus, POLL_INTERVAL_MS);
-            return;
-          }
-
-          if (statusBody.state === "error") {
-            stopTimers();
-            setPhase("error");
-            setError(statusBody.message || "Something went wrong separating that song. Please try again.");
-            return;
-          }
-
-          stopTimers();
-          setProgress(100);
-          setElapsed(0);
-          setDuration(0);
-          setIsPlaying(false);
-          setVocalLevel(DEFAULT_VOCAL_LEVEL);
-          setStems({
-            title: statusBody.title || "song",
-            instrumentalUrl: base64ToBlobUrl(statusBody.instrumental_base64, "audio/mpeg"),
-            vocalsUrl: base64ToBlobUrl(statusBody.vocals_base64, "audio/mpeg"),
-          });
-          setPhase("done");
         } catch {
-          // A single stalled request (flaky connection, backgrounded tab)
-          // shouldn't kill the whole job - only give up after several in a row.
           consecutiveFailures += 1;
           if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
             stopTimers();
@@ -388,8 +367,46 @@ export default function Home() {
           }
           setProgress((p) => Math.min(p + 4, 92));
           pollTimer.current = setTimeout(pollStatus, POLL_INTERVAL_MS);
+          return;
         } finally {
           clearTimeout(abortTimer);
+        }
+
+        if (statusBody.state === "pending") {
+          setProgress((p) => Math.min(p + 4, 92));
+          pollTimer.current = setTimeout(pollStatus, POLL_INTERVAL_MS);
+          return;
+        }
+
+        if (statusBody.state === "error") {
+          stopTimers();
+          setPhase("error");
+          setError((statusBody.message as string) || "Something went wrong separating that song. Please try again.");
+          return;
+        }
+
+        // We have the finished result - from here on, any failure (a bad
+        // payload, a browser quirk building the blob URLs) is a real, fatal
+        // error, not a network hiccup. It must never fall back into the
+        // retry path above, or the UI would silently loop "working"
+        // forever instead of ever surfacing the problem.
+        stopTimers();
+        try {
+          setProgress(100);
+          setElapsed(0);
+          setDuration(0);
+          setIsPlaying(false);
+          setVocalLevel(DEFAULT_VOCAL_LEVEL);
+          setStems({
+            title: (statusBody.title as string) || "song",
+            instrumentalUrl: base64ToBlobUrl(statusBody.instrumental_base64 as string, "audio/mpeg"),
+            vocalsUrl: base64ToBlobUrl(statusBody.vocals_base64 as string, "audio/mpeg"),
+          });
+          setPhase("done");
+        } catch (err) {
+          console.error("Failed to load separated tracks for playback:", err);
+          setPhase("error");
+          setError("Got the separated tracks back, but couldn't load them for playback. Please try again.");
         }
       };
 
