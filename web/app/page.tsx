@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { PitchShifter } from "soundtouchjs";
 import KeyWheel from "./components/KeyWheel";
 import { detectKey, shortestSemitoneDistance, type Mode } from "./lib/keyDetection";
+import { createPitchShiftNode, type PitchShiftNodeHandle } from "./lib/pitchShiftNode";
 import styles from "./page.module.css";
 
 const API_BASE = process.env.NEXT_PUBLIC_STRIPPER_API_URL;
@@ -27,16 +27,6 @@ const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 const MIN_VOCAL_LEVEL = 0;
 const MAX_VOCAL_LEVEL = 150;
 const DEFAULT_VOCAL_LEVEL = 0;
-
-// If the two stems' playback positions ever drift apart by more than this
-// (two independently-clocked processing nodes, even sharing one
-// AudioContext), snap the vocal track back in line.
-const MAX_DRIFT_SECONDS = 0.2;
-
-// Passed to soundtouchjs's PitchShifter - the size of each chunk of audio
-// it processes at a time. Same value used for live playback and offline
-// (download) rendering so the two paths behave identically.
-const PITCH_SHIFTER_BUFFER_SIZE = 4096;
 
 type Phase = "idle" | "working" | "done" | "error";
 
@@ -120,14 +110,18 @@ export default function Home() {
   const [detectedTonic, setDetectedTonic] = useState<number | null>(null);
   const [detectedMode, setDetectedMode] = useState<Mode | null>(null);
   const [selectedTonic, setSelectedTonic] = useState<number | null>(null);
+  // False while the decoded audio is still being handed off to the pitch
+  // -shift AudioWorklet - keeps the play button disabled with a "Loading"
+  // label instead of letting playback start against a not-yet-ready graph.
+  const [playbackReady, setPlaybackReady] = useState(false);
 
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phraseTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const instrumentalShifterRef = useRef<PitchShifter | null>(null);
-  const vocalsShifterRef = useRef<PitchShifter | null>(null);
+  const instrumentalNodeRef = useRef<PitchShiftNodeHandle | null>(null);
+  const vocalsNodeRef = useRef<PitchShiftNodeHandle | null>(null);
   const vocalGainRef = useRef<GainNode | null>(null);
 
   function getAudioContext(): AudioContext {
@@ -148,53 +142,62 @@ export default function Home() {
       : 0;
 
   // Build the playback graph from the fully-decoded stems, routed through
-  // soundtouchjs's PitchShifter (tempo-preserving pitch shift) so both the
-  // key wheel and the vocal-level slider can be driven live, the same
-  // "no extra network round-trip per control move" way the original
-  // <audio>-element graph worked.
+  // a pitch-shift AudioWorklet (tempo-preserving pitch shift, running on
+  // the dedicated audio thread rather than fighting React for main-thread
+  // time) so both the key wheel and the vocal-level slider can be driven
+  // live, the same "no extra network round-trip per control move" way the
+  // original <audio>-element graph worked.
   useEffect(() => {
     if (!stems) return;
+    let cancelled = false;
 
     const ctx = getAudioContext();
-
-    const vocalsShifter = new PitchShifter(ctx, stems.vocalsBuffer, PITCH_SHIFTER_BUFFER_SIZE);
     const gainNode = ctx.createGain();
     gainNode.gain.value = DEFAULT_VOCAL_LEVEL / 100;
-    vocalsShifter.connect(gainNode);
 
-    function handleEnded() {
-      instrumentalShifter.disconnect();
-      gainNode.disconnect();
-      instrumentalShifter.percentagePlayed = 0;
-      vocalsShifter.percentagePlayed = 0;
-      setIsPlaying(false);
-      setElapsed(0);
-    }
-
-    const instrumentalShifter = new PitchShifter(
-      ctx,
-      stems.instrumentalBuffer,
-      PITCH_SHIFTER_BUFFER_SIZE,
-      handleEnded
-    );
-
-    instrumentalShifter.on("play", (detail) => {
-      setElapsed(detail.timePlayed);
-      if (Math.abs(vocalsShifter.timePlayed - detail.timePlayed) > MAX_DRIFT_SECONDS) {
-        vocalsShifter.percentagePlayed = instrumentalShifter.percentagePlayed;
+    Promise.all([
+      createPitchShiftNode(ctx, stems.instrumentalBuffer),
+      createPitchShiftNode(ctx, stems.vocalsBuffer),
+    ]).then(async ([instrumentalHandle, vocalsHandle]) => {
+      if (cancelled) {
+        instrumentalHandle.destroy();
+        vocalsHandle.destroy();
+        return;
       }
+
+      instrumentalHandle.node.connect(ctx.destination);
+      vocalsHandle.node.connect(gainNode).connect(ctx.destination);
+
+      instrumentalHandle.onEnded(() => {
+        vocalsHandle.pause();
+        instrumentalHandle.seekToSeconds(0);
+        vocalsHandle.seekToSeconds(0);
+        setIsPlaying(false);
+        setElapsed(0);
+      });
+      instrumentalHandle.onPosition((seconds) => setElapsed(seconds));
+
+      await Promise.all([instrumentalHandle.whenLoaded(), vocalsHandle.whenLoaded()]);
+      if (cancelled) {
+        instrumentalHandle.destroy();
+        vocalsHandle.destroy();
+        return;
+      }
+
+      instrumentalNodeRef.current = instrumentalHandle;
+      vocalsNodeRef.current = vocalsHandle;
+      setPlaybackReady(true);
     });
 
-    instrumentalShifterRef.current = instrumentalShifter;
-    vocalsShifterRef.current = vocalsShifter;
     vocalGainRef.current = gainNode;
 
     return () => {
-      instrumentalShifter.disconnect();
+      cancelled = true;
+      instrumentalNodeRef.current?.destroy();
+      vocalsNodeRef.current?.destroy();
       gainNode.disconnect();
-      instrumentalShifter.off();
-      instrumentalShifterRef.current = null;
-      vocalsShifterRef.current = null;
+      instrumentalNodeRef.current = null;
+      vocalsNodeRef.current = null;
       vocalGainRef.current = null;
     };
   }, [stems]);
@@ -223,13 +226,13 @@ export default function Home() {
     };
   }, [stems]);
 
-  // Apply the selected key live - just updates a parameter soundtouchjs
-  // picks up on its next processed chunk, no need to rebuild the graph or
+  // Apply the selected key live - just updates an AudioParam the worklet
+  // picks up on its next render quantum, no need to rebuild the graph or
   // interrupt playback.
   useEffect(() => {
-    if (instrumentalShifterRef.current) instrumentalShifterRef.current.pitchSemitones = semitoneShift;
-    if (vocalsShifterRef.current) vocalsShifterRef.current.pitchSemitones = semitoneShift;
-  }, [semitoneShift]);
+    instrumentalNodeRef.current?.setPitchSemitones(semitoneShift);
+    vocalsNodeRef.current?.setPitchSemitones(semitoneShift);
+  }, [semitoneShift, playbackReady]);
 
   useEffect(() => {
     return () => {
@@ -245,14 +248,13 @@ export default function Home() {
   }
 
   function togglePlay() {
-    const instrumentalShifter = instrumentalShifterRef.current;
-    const vocalsShifter = vocalsShifterRef.current;
-    const gainNode = vocalGainRef.current;
-    if (!instrumentalShifter || !vocalsShifter || !gainNode) return;
+    const instrumentalHandle = instrumentalNodeRef.current;
+    const vocalsHandle = vocalsNodeRef.current;
+    if (!instrumentalHandle || !vocalsHandle) return;
 
     if (isPlaying) {
-      instrumentalShifter.disconnect();
-      gainNode.disconnect();
+      instrumentalHandle.pause();
+      vocalsHandle.pause();
       setIsPlaying(false);
       return;
     }
@@ -260,8 +262,8 @@ export default function Home() {
     const ctx = getAudioContext();
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
-    instrumentalShifter.connect(ctx.destination);
-    gainNode.connect(ctx.destination);
+    instrumentalHandle.play();
+    vocalsHandle.play();
     setIsPlaying(true);
   }
 
@@ -286,6 +288,7 @@ export default function Home() {
     setDetectedTonic(null);
     setDetectedMode(null);
     setSelectedTonic(null);
+    setPlaybackReady(false);
   }
 
   async function handleDownload() {
@@ -299,16 +302,23 @@ export default function Home() {
       // same regardless of the chosen key.
       const offlineCtx = new OfflineAudioContext(2, length, instrumentalBuffer.sampleRate);
 
-      const instrumentalShifter = new PitchShifter(offlineCtx, instrumentalBuffer, PITCH_SHIFTER_BUFFER_SIZE);
-      instrumentalShifter.pitchSemitones = semitoneShift;
-      instrumentalShifter.connect(offlineCtx.destination);
-
-      const vocalsShifter = new PitchShifter(offlineCtx, vocalsBuffer, PITCH_SHIFTER_BUFFER_SIZE);
-      vocalsShifter.pitchSemitones = semitoneShift;
+      const [instrumentalHandle, vocalsHandle] = await Promise.all([
+        createPitchShiftNode(offlineCtx, instrumentalBuffer, { autoPlay: true }),
+        createPitchShiftNode(offlineCtx, vocalsBuffer, { autoPlay: true }),
+      ]);
+      instrumentalHandle.setPitchSemitones(semitoneShift);
+      vocalsHandle.setPitchSemitones(semitoneShift);
+      instrumentalHandle.node.connect(offlineCtx.destination);
       const gainNode = offlineCtx.createGain();
       gainNode.gain.value = vocalLevel / 100;
-      vocalsShifter.connect(gainNode);
+      vocalsHandle.node.connect(gainNode);
       gainNode.connect(offlineCtx.destination);
+
+      // Rendering must not start until both worklets have actually
+      // received their audio (and, per autoPlay, are already marked
+      // playing) - otherwise startRendering() could race ahead of the
+      // still-in-flight buffer transfer and render silence.
+      await Promise.all([instrumentalHandle.whenLoaded(), vocalsHandle.whenLoaded()]);
 
       const rendered = await offlineCtx.startRendering();
       const blob = audioBufferToWavBlob(rendered);
@@ -432,6 +442,7 @@ export default function Home() {
           setDetectedTonic(null);
           setDetectedMode(null);
           setSelectedTonic(null);
+          setPlaybackReady(false);
           setStems({
             title: (statusBody.title as string) || "song",
             instrumentalBuffer,
@@ -524,9 +535,12 @@ export default function Home() {
                 type="button"
                 className={styles.playButton}
                 onClick={togglePlay}
-                aria-label={isPlaying ? "Pause" : "Play"}
+                disabled={!playbackReady}
+                aria-label={!playbackReady ? "Loading" : isPlaying ? "Pause" : "Play"}
               >
-                {isPlaying ? (
+                {!playbackReady ? (
+                  <span className={styles.spinner} aria-hidden="true" />
+                ) : isPlaying ? (
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                     <rect x="5" y="4" width="5" height="16" rx="1" />
                     <rect x="14" y="4" width="5" height="16" rx="1" />
@@ -540,7 +554,7 @@ export default function Home() {
               <div className={styles.trackMeta}>
                 <div className={styles.trackName}>{stems.title}</div>
                 <div className={styles.trackSub}>
-                  {formatTime(elapsed)} / {formatTime(duration)}
+                  {playbackReady ? `${formatTime(elapsed)} / ${formatTime(duration)}` : "Preparing playback…"}
                 </div>
               </div>
             </div>
