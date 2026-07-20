@@ -187,6 +187,10 @@ export default function Home() {
       instrumentalNodeRef.current = instrumentalHandle;
       vocalsNodeRef.current = vocalsHandle;
       setPlaybackReady(true);
+    }).catch((err) => {
+      if (cancelled) return;
+      console.error("Failed to set up playback:", err);
+      setError("Couldn't set up playback for this song. Try reloading the page.");
     });
 
     vocalGainRef.current = gainNode;
