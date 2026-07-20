@@ -255,6 +255,14 @@
   color: var(--text-faint);
 }
 
+.sectionLabel {
+  width: 100%;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  text-align: left;
+}
+
 .sliderBlock {
   width: 100%;
   display: flex;
