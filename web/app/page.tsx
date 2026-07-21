@@ -112,6 +112,23 @@ function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
 }
 
 export default function Home() {
+  // Starts as "checking..." on both server and client - anything that
+  // reads `window`/browser feature support has to be resolved after
+  // mount (below), never during the initial render, or the server-
+  // rendered HTML and the client's first render disagree and React
+  // throws a hydration-mismatch error.
+  const [diagnostics, setDiagnostics] = useState({
+    audioContextState: "not created",
+    audioWorkletSupported: "checking…",
+    lastGlobalError: "",
+  });
+  const [testToneStatus, setTestToneStatus] = useState<"idle" | "playing" | "done">("idle");
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- this can only be known client-side (after mount), by design
+    setDiagnostics((d) => ({ ...d, audioWorkletSupported: "AudioWorkletNode" in window ? "yes" : "no" }));
+  }, []);
+
   const [file, setFile] = useState<File | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState("");
@@ -146,8 +163,50 @@ export default function Home() {
   function getAudioContext(): AudioContext {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new AudioContext();
+      audioCtxRef.current.addEventListener("statechange", () => {
+        setDiagnostics((d) => ({ ...d, audioContextState: audioCtxRef.current?.state ?? "unknown" }));
+      });
+      setDiagnostics((d) => ({ ...d, audioContextState: audioCtxRef.current?.state ?? "unknown" }));
     }
     return audioCtxRef.current;
+  }
+
+  // Surfaces anything that would otherwise fail completely silently -
+  // without this, a bug outside the try/catch blocks below (or in a
+  // browser quirk this code doesn't anticipate) would just look like
+  // "nothing happens" with no way to tell what went wrong.
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      setDiagnostics((d) => ({ ...d, lastGlobalError: event.message || String(event.error) }));
+    };
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      setDiagnostics((d) => ({ ...d, lastGlobalError: String(event.reason) }));
+    };
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
+  }, []);
+
+  // A short beep generated straight from an OscillatorNode - the simplest
+  // possible Web Audio playback, with no decoding, no worklet, and none of
+  // this app's own code in the way. Lets a device that's reporting "no
+  // audio" tell us whether Web Audio playback works AT ALL on it, or
+  // whether the problem is specific to the song-playback pipeline.
+  function playTestTone() {
+    const ctx = getAudioContext();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 440;
+    gain.gain.value = 0.2;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.6);
+    setTestToneStatus("playing");
+    osc.onended = () => setTestToneStatus("done");
   }
 
   const duration = stems?.instrumentalBuffer.duration || 0;
@@ -642,6 +701,20 @@ export default function Home() {
             </button>
           </>
         ) : null}
+
+        <div className={styles.diagnostics}>
+          <button type="button" className={styles.diagnosticsButton} onClick={playTestTone}>
+            {testToneStatus === "playing" ? "Playing beep…" : "Test sound"}
+          </button>
+          <span className={styles.diagnosticsText}>
+            audio: {diagnostics.audioContextState}
+            {" · "}worklet: {diagnostics.audioWorkletSupported}
+            {testToneStatus === "done" && " · beep played"}
+          </span>
+          {diagnostics.lastGlobalError && (
+            <span className={styles.diagnosticsText}>error: {diagnostics.lastGlobalError}</span>
+          )}
+        </div>
       </div>
     </main>
   );
