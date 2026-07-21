@@ -3,8 +3,23 @@
 import { useEffect, useRef, useState } from "react";
 import KeyWheel from "./components/KeyWheel";
 import { detectKey, shortestSemitoneDistance, type Mode } from "./lib/keyDetection";
-import { createPitchShiftNode, type PitchShiftNodeHandle } from "./lib/pitchShiftNode";
+import { createNativePlaybackNode } from "./lib/nativePlayback";
+import type { PlaybackHandle } from "./lib/playbackHandle";
+import { createPitchShiftNode } from "./lib/pitchShiftNode";
 import styles from "./page.module.css";
+
+// Tries the pitch-shift AudioWorklet first; if it can't be set up for any
+// reason (unsupported browser, a failed module load, ...), falls back to
+// plain playback so the song is never left completely silent - it just
+// can't change key in that case.
+async function buildPlaybackHandle(context: BaseAudioContext, buffer: AudioBuffer): Promise<PlaybackHandle> {
+  try {
+    return await createPitchShiftNode(context, buffer);
+  } catch (err) {
+    console.error("Pitch-shift playback unavailable, falling back to plain playback:", err);
+    return createNativePlaybackNode(context, buffer);
+  }
+}
 
 const API_BASE = process.env.NEXT_PUBLIC_STRIPPER_API_URL;
 
@@ -110,18 +125,22 @@ export default function Home() {
   const [detectedTonic, setDetectedTonic] = useState<number | null>(null);
   const [detectedMode, setDetectedMode] = useState<Mode | null>(null);
   const [selectedTonic, setSelectedTonic] = useState<number | null>(null);
-  // False while the decoded audio is still being handed off to the pitch
-  // -shift AudioWorklet - keeps the play button disabled with a "Loading"
+  // False while the decoded audio is still being handed off to the
+  // playback graph - keeps the play button disabled with a "Loading"
   // label instead of letting playback start against a not-yet-ready graph.
   const [playbackReady, setPlaybackReady] = useState(false);
+  // False if the pitch-shift worklet couldn't be set up and playback fell
+  // back to the plain (non-key-changeable) path - disables the wheel with
+  // an explanation instead of pretending it still does something.
+  const [pitchShiftAvailable, setPitchShiftAvailable] = useState(true);
 
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phraseTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const instrumentalNodeRef = useRef<PitchShiftNodeHandle | null>(null);
-  const vocalsNodeRef = useRef<PitchShiftNodeHandle | null>(null);
+  const instrumentalNodeRef = useRef<PlaybackHandle | null>(null);
+  const vocalsNodeRef = useRef<PlaybackHandle | null>(null);
   const vocalGainRef = useRef<GainNode | null>(null);
 
   function getAudioContext(): AudioContext {
@@ -141,12 +160,14 @@ export default function Home() {
       ? shortestSemitoneDistance(detectedTonic, selectedTonic)
       : 0;
 
-  // Build the playback graph from the fully-decoded stems, routed through
-  // a pitch-shift AudioWorklet (tempo-preserving pitch shift, running on
+  // Build the playback graph from the fully-decoded stems, preferring a
+  // pitch-shift AudioWorklet (tempo-preserving pitch shift, running on
   // the dedicated audio thread rather than fighting React for main-thread
   // time) so both the key wheel and the vocal-level slider can be driven
   // live, the same "no extra network round-trip per control move" way the
-  // original <audio>-element graph worked.
+  // original <audio>-element graph worked. Falls back to plain playback
+  // (see buildPlaybackHandle) if the worklet can't be used, so the song
+  // is never left silent.
   useEffect(() => {
     if (!stems) return;
     let cancelled = false;
@@ -156,8 +177,8 @@ export default function Home() {
     gainNode.gain.value = DEFAULT_VOCAL_LEVEL / 100;
 
     Promise.all([
-      createPitchShiftNode(ctx, stems.instrumentalBuffer),
-      createPitchShiftNode(ctx, stems.vocalsBuffer),
+      buildPlaybackHandle(ctx, stems.instrumentalBuffer),
+      buildPlaybackHandle(ctx, stems.vocalsBuffer),
     ]).then(async ([instrumentalHandle, vocalsHandle]) => {
       if (cancelled) {
         instrumentalHandle.destroy();
@@ -186,6 +207,7 @@ export default function Home() {
 
       instrumentalNodeRef.current = instrumentalHandle;
       vocalsNodeRef.current = vocalsHandle;
+      setPitchShiftAvailable(instrumentalHandle.supportsPitchShift && vocalsHandle.supportsPitchShift);
       setPlaybackReady(true);
     }).catch((err) => {
       if (cancelled) return;
@@ -293,6 +315,7 @@ export default function Home() {
     setDetectedMode(null);
     setSelectedTonic(null);
     setPlaybackReady(false);
+    setPitchShiftAvailable(true);
   }
 
   async function handleDownload() {
@@ -306,12 +329,21 @@ export default function Home() {
       // same regardless of the chosen key.
       const offlineCtx = new OfflineAudioContext(2, length, instrumentalBuffer.sampleRate);
 
+      const buildOfflineHandle = (buf: AudioBuffer) =>
+        createPitchShiftNode(offlineCtx, buf, { autoPlay: true }).catch((err) => {
+          console.error("Pitch-shift render unavailable, falling back to plain render:", err);
+          const handle = createNativePlaybackNode(offlineCtx, buf);
+          handle.play();
+          return handle;
+        });
+
       const [instrumentalHandle, vocalsHandle] = await Promise.all([
-        createPitchShiftNode(offlineCtx, instrumentalBuffer, { autoPlay: true }),
-        createPitchShiftNode(offlineCtx, vocalsBuffer, { autoPlay: true }),
+        buildOfflineHandle(instrumentalBuffer),
+        buildOfflineHandle(vocalsBuffer),
       ]);
-      instrumentalHandle.setPitchSemitones(semitoneShift);
-      vocalsHandle.setPitchSemitones(semitoneShift);
+      const appliedShift = instrumentalHandle.supportsPitchShift && vocalsHandle.supportsPitchShift ? semitoneShift : 0;
+      instrumentalHandle.setPitchSemitones(appliedShift);
+      vocalsHandle.setPitchSemitones(appliedShift);
       instrumentalHandle.node.connect(offlineCtx.destination);
       const gainNode = offlineCtx.createGain();
       gainNode.gain.value = vocalLevel / 100;
@@ -329,7 +361,7 @@ export default function Home() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const keySuffix = semitoneShift === 0 ? "" : `, key ${semitoneShift > 0 ? "+" : ""}${semitoneShift}`;
+      const keySuffix = appliedShift === 0 ? "" : `, key ${appliedShift > 0 ? "+" : ""}${appliedShift}`;
       a.download = `${stems.title} (vocals ${vocalLevel}%${keySuffix}).wav`;
       document.body.appendChild(a);
       a.click();
@@ -447,6 +479,7 @@ export default function Home() {
           setDetectedMode(null);
           setSelectedTonic(null);
           setPlaybackReady(false);
+          setPitchShiftAvailable(true);
           setStems({
             title: (statusBody.title as string) || "song",
             instrumentalBuffer,
@@ -564,13 +597,19 @@ export default function Home() {
             </div>
 
             <div className={styles.sectionLabel}>Key</div>
-            <KeyWheel
-              detectedTonic={detectedTonic}
-              detectedMode={detectedMode}
-              selectedTonic={selectedTonic}
-              onSelectTonic={setSelectedTonic}
-              disabled={detectedTonic === null}
-            />
+            {playbackReady && !pitchShiftAvailable ? (
+              <p className={styles.subline} style={{ marginTop: 0 }}>
+                Key changing isn&apos;t available in this browser, but playback still works.
+              </p>
+            ) : (
+              <KeyWheel
+                detectedTonic={detectedTonic}
+                detectedMode={detectedMode}
+                selectedTonic={selectedTonic}
+                onSelectTonic={setSelectedTonic}
+                disabled={detectedTonic === null}
+              />
+            )}
 
             <div className={styles.sliderBlock}>
               <div className={styles.sliderLabelRow}>

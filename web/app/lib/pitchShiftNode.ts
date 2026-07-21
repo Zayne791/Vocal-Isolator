@@ -3,32 +3,25 @@
 // and exposing a small play/pause/seek/position API so page.tsx doesn't
 // need to know about the underlying postMessage protocol.
 
+import type { PlaybackHandle } from "./playbackHandle";
+
 const WORKLET_URL = "/worklets/pitch-shift-processor.js";
 const loadedModules = new WeakSet<BaseAudioContext>();
 
 async function ensureWorkletModule(context: BaseAudioContext): Promise<void> {
   if (loadedModules.has(context)) return;
+  if (!("audioWorklet" in context)) {
+    throw new Error("AudioWorklet isn't supported in this browser.");
+  }
   await context.audioWorklet.addModule(WORKLET_URL);
   loadedModules.add(context);
 }
-
-export type PitchShiftNodeHandle = {
-  node: AudioWorkletNode;
-  setPitchSemitones(value: number): void;
-  play(): void;
-  pause(): void;
-  seekToSeconds(seconds: number): void;
-  onEnded(cb: () => void): void;
-  onPosition(cb: (seconds: number) => void): void;
-  whenLoaded(): Promise<void>;
-  destroy(): void;
-};
 
 export async function createPitchShiftNode(
   context: BaseAudioContext,
   buffer: AudioBuffer,
   options?: { autoPlay?: boolean }
-): Promise<PitchShiftNodeHandle> {
+): Promise<PlaybackHandle> {
   await ensureWorkletModule(context);
 
   const node = new AudioWorkletNode(context, "pitch-shift-processor", {
@@ -73,6 +66,7 @@ export async function createPitchShiftNode(
 
   return {
     node,
+    supportsPitchShift: true,
     setPitchSemitones(value: number) {
       pitchParam?.setValueAtTime(value, context.currentTime);
     },
