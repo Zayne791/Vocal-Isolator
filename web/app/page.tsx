@@ -1,7 +1,25 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import KeyWheel from "./components/KeyWheel";
+import { detectKey, shortestSemitoneDistance, type Mode } from "./lib/keyDetection";
+import { createNativePlaybackNode } from "./lib/nativePlayback";
+import type { PlaybackHandle } from "./lib/playbackHandle";
+import { createPitchShiftNode } from "./lib/pitchShiftNode";
 import styles from "./page.module.css";
+
+// Tries the pitch-shift AudioWorklet first; if it can't be set up for any
+// reason (unsupported browser, a failed module load, ...), falls back to
+// plain playback so the song is never left completely silent - it just
+// can't change key in that case.
+async function buildPlaybackHandle(context: BaseAudioContext, buffer: AudioBuffer): Promise<PlaybackHandle> {
+  try {
+    return await createPitchShiftNode(context, buffer);
+  } catch (err) {
+    console.error("Pitch-shift playback unavailable, falling back to plain playback:", err);
+    return createNativePlaybackNode(context, buffer);
+  }
+}
 
 const API_BASE = process.env.NEXT_PUBLIC_STRIPPER_API_URL;
 
@@ -25,16 +43,12 @@ const MIN_VOCAL_LEVEL = 0;
 const MAX_VOCAL_LEVEL = 150;
 const DEFAULT_VOCAL_LEVEL = 0;
 
-// If the two stems ever drift out of sync by more than this (independent
-// <audio> elements aren't sample-locked), snap the vocal track back.
-const MAX_DRIFT_SECONDS = 0.2;
-
 type Phase = "idle" | "working" | "done" | "error";
 
 type Stems = {
   title: string;
-  instrumentalUrl: string;
-  vocalsUrl: string;
+  instrumentalBuffer: AudioBuffer;
+  vocalsBuffer: AudioBuffer;
 };
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
@@ -44,10 +58,6 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes.buffer;
-}
-
-function base64ToBlobUrl(base64: string, mimeType: string): string {
-  return URL.createObjectURL(new Blob([base64ToArrayBuffer(base64)], { type: mimeType }));
 }
 
 function formatTime(seconds: number): string {
@@ -102,6 +112,23 @@ function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
 }
 
 export default function Home() {
+  // Starts as "checking..." on both server and client - anything that
+  // reads `window`/browser feature support has to be resolved after
+  // mount (below), never during the initial render, or the server-
+  // rendered HTML and the client's first render disagree and React
+  // throws a hydration-mismatch error.
+  const [diagnostics, setDiagnostics] = useState({
+    audioContextState: "not created",
+    audioWorkletSupported: "checking…",
+    lastGlobalError: "",
+  });
+  const [testToneStatus, setTestToneStatus] = useState<"idle" | "playing" | "done">("idle");
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- this can only be known client-side (after mount), by design
+    setDiagnostics((d) => ({ ...d, audioWorkletSupported: "AudioWorkletNode" in window ? "yes" : "no" }));
+  }, []);
+
   const [file, setFile] = useState<File | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState("");
@@ -111,86 +138,186 @@ export default function Home() {
   const [vocalLevel, setVocalLevel] = useState(DEFAULT_VOCAL_LEVEL);
   const [isPlaying, setIsPlaying] = useState(false);
   const [elapsed, setElapsed] = useState(0);
-  const [duration, setDuration] = useState(0);
   const [isRendering, setIsRendering] = useState(false);
+  const [detectedTonic, setDetectedTonic] = useState<number | null>(null);
+  const [detectedMode, setDetectedMode] = useState<Mode | null>(null);
+  const [selectedTonic, setSelectedTonic] = useState<number | null>(null);
+  // False while the decoded audio is still being handed off to the
+  // playback graph - keeps the play button disabled with a "Loading"
+  // label instead of letting playback start against a not-yet-ready graph.
+  const [playbackReady, setPlaybackReady] = useState(false);
+  // False if the pitch-shift worklet couldn't be set up and playback fell
+  // back to the plain (non-key-changeable) path - disables the wheel with
+  // an explanation instead of pretending it still does something.
+  const [pitchShiftAvailable, setPitchShiftAvailable] = useState(true);
 
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phraseTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const instrumentalAudioRef = useRef<HTMLAudioElement | null>(null);
-  const vocalsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const instrumentalNodeRef = useRef<PlaybackHandle | null>(null);
+  const vocalsNodeRef = useRef<PlaybackHandle | null>(null);
   const vocalGainRef = useRef<GainNode | null>(null);
 
   function getAudioContext(): AudioContext {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new AudioContext();
+      audioCtxRef.current.addEventListener("statechange", () => {
+        setDiagnostics((d) => ({ ...d, audioContextState: audioCtxRef.current?.state ?? "unknown" }));
+      });
+      setDiagnostics((d) => ({ ...d, audioContextState: audioCtxRef.current?.state ?? "unknown" }));
     }
     return audioCtxRef.current;
   }
 
-  // Build the playback graph as native <audio> elements (fast, streamed,
-  // handled by the browser's own robust media pipeline) routed through
-  // Web Audio only so the vocal track's volume can be driven live by the
-  // slider - including boosting past 100%, which <audio>.volume can't do.
+  // Surfaces anything that would otherwise fail completely silently -
+  // without this, a bug outside the try/catch blocks below (or in a
+  // browser quirk this code doesn't anticipate) would just look like
+  // "nothing happens" with no way to tell what went wrong.
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      setDiagnostics((d) => ({ ...d, lastGlobalError: event.message || String(event.error) }));
+    };
+    const handleRejection = (event: PromiseRejectionEvent) => {
+      setDiagnostics((d) => ({ ...d, lastGlobalError: String(event.reason) }));
+    };
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
+  }, []);
+
+  // A short beep generated straight from an OscillatorNode - the simplest
+  // possible Web Audio playback, with no decoding, no worklet, and none of
+  // this app's own code in the way. Lets a device that's reporting "no
+  // audio" tell us whether Web Audio playback works AT ALL on it, or
+  // whether the problem is specific to the song-playback pipeline.
+  function playTestTone() {
+    const ctx = getAudioContext();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = 440;
+    gain.gain.value = 0.2;
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.6);
+    setTestToneStatus("playing");
+    osc.onended = () => setTestToneStatus("done");
+  }
+
+  const duration = stems?.instrumentalBuffer.duration || 0;
+
+  // How far, in semitones, the currently selected key sits from the
+  // detected one - 0 until a key is picked on the wheel (or before
+  // detection finishes, since the wheel starts pointed at the detected key).
+  const semitoneShift =
+    detectedTonic !== null && selectedTonic !== null
+      ? shortestSemitoneDistance(detectedTonic, selectedTonic)
+      : 0;
+
+  // Build the playback graph from the fully-decoded stems, preferring a
+  // pitch-shift AudioWorklet (tempo-preserving pitch shift, running on
+  // the dedicated audio thread rather than fighting React for main-thread
+  // time) so both the key wheel and the vocal-level slider can be driven
+  // live, the same "no extra network round-trip per control move" way the
+  // original <audio>-element graph worked. Falls back to plain playback
+  // (see buildPlaybackHandle) if the worklet can't be used, so the song
+  // is never left silent.
   useEffect(() => {
     if (!stems) return;
+    let cancelled = false;
 
     const ctx = getAudioContext();
-
-    const instrumentalEl = new Audio(stems.instrumentalUrl);
-    instrumentalEl.preload = "auto";
-
-    const vocalsEl = new Audio(stems.vocalsUrl);
-    vocalsEl.preload = "auto";
-
-    const instrumentalSource = ctx.createMediaElementSource(instrumentalEl);
-    instrumentalSource.connect(ctx.destination);
-
-    const vocalsSource = ctx.createMediaElementSource(vocalsEl);
     const gainNode = ctx.createGain();
     gainNode.gain.value = DEFAULT_VOCAL_LEVEL / 100;
-    vocalsSource.connect(gainNode).connect(ctx.destination);
 
-    const handleLoadedMetadata = () => setDuration(instrumentalEl.duration || 0);
-    const handleTimeUpdate = () => {
-      setElapsed(instrumentalEl.currentTime);
-      if (Math.abs(vocalsEl.currentTime - instrumentalEl.currentTime) > MAX_DRIFT_SECONDS) {
-        vocalsEl.currentTime = instrumentalEl.currentTime;
+    Promise.all([
+      buildPlaybackHandle(ctx, stems.instrumentalBuffer),
+      buildPlaybackHandle(ctx, stems.vocalsBuffer),
+    ]).then(async ([instrumentalHandle, vocalsHandle]) => {
+      if (cancelled) {
+        instrumentalHandle.destroy();
+        vocalsHandle.destroy();
+        return;
       }
-    };
-    const handleEnded = () => {
-      setIsPlaying(false);
-      setElapsed(0);
-      vocalsEl.pause();
-      vocalsEl.currentTime = 0;
-    };
 
-    instrumentalEl.addEventListener("loadedmetadata", handleLoadedMetadata);
-    instrumentalEl.addEventListener("timeupdate", handleTimeUpdate);
-    instrumentalEl.addEventListener("ended", handleEnded);
+      instrumentalHandle.node.connect(ctx.destination);
+      vocalsHandle.node.connect(gainNode).connect(ctx.destination);
 
-    instrumentalAudioRef.current = instrumentalEl;
-    vocalsAudioRef.current = vocalsEl;
+      instrumentalHandle.onEnded(() => {
+        vocalsHandle.pause();
+        instrumentalHandle.seekToSeconds(0);
+        vocalsHandle.seekToSeconds(0);
+        setIsPlaying(false);
+        setElapsed(0);
+      });
+      instrumentalHandle.onPosition((seconds) => setElapsed(seconds));
+
+      await Promise.all([instrumentalHandle.whenLoaded(), vocalsHandle.whenLoaded()]);
+      if (cancelled) {
+        instrumentalHandle.destroy();
+        vocalsHandle.destroy();
+        return;
+      }
+
+      instrumentalNodeRef.current = instrumentalHandle;
+      vocalsNodeRef.current = vocalsHandle;
+      setPitchShiftAvailable(instrumentalHandle.supportsPitchShift && vocalsHandle.supportsPitchShift);
+      setPlaybackReady(true);
+    }).catch((err) => {
+      if (cancelled) return;
+      console.error("Failed to set up playback:", err);
+      setError("Couldn't set up playback for this song. Try reloading the page.");
+    });
+
     vocalGainRef.current = gainNode;
 
     return () => {
-      instrumentalEl.pause();
-      vocalsEl.pause();
-      instrumentalEl.removeEventListener("loadedmetadata", handleLoadedMetadata);
-      instrumentalEl.removeEventListener("timeupdate", handleTimeUpdate);
-      instrumentalEl.removeEventListener("ended", handleEnded);
-      instrumentalSource.disconnect();
-      vocalsSource.disconnect();
+      cancelled = true;
+      instrumentalNodeRef.current?.destroy();
+      vocalsNodeRef.current?.destroy();
       gainNode.disconnect();
-      URL.revokeObjectURL(stems.instrumentalUrl);
-      URL.revokeObjectURL(stems.vocalsUrl);
-      instrumentalAudioRef.current = null;
-      vocalsAudioRef.current = null;
+      instrumentalNodeRef.current = null;
+      vocalsNodeRef.current = null;
       vocalGainRef.current = null;
     };
   }, [stems]);
+
+  // Detect the song's key once the stems are decoded. Deferred a tick so
+  // the "Your song is ready" UI paints first - the wheel shows a
+  // "Detecting..." state in the meantime.
+  useEffect(() => {
+    if (!stems) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      const instData = stems.instrumentalBuffer.getChannelData(0);
+      const vocData = stems.vocalsBuffer.getChannelData(0);
+      const length = Math.min(instData.length, vocData.length);
+      const mix = new Float32Array(length);
+      for (let i = 0; i < length; i++) mix[i] = instData[i] + vocData[i];
+      const result = detectKey(mix, stems.instrumentalBuffer.sampleRate);
+      if (cancelled) return;
+      setDetectedTonic(result.tonic);
+      setDetectedMode(result.mode);
+      setSelectedTonic(result.tonic);
+    }, 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [stems]);
+
+  // Apply the selected key live - just updates an AudioParam the worklet
+  // picks up on its next render quantum, no need to rebuild the graph or
+  // interrupt playback.
+  useEffect(() => {
+    instrumentalNodeRef.current?.setPitchSemitones(semitoneShift);
+    vocalsNodeRef.current?.setPitchSemitones(semitoneShift);
+  }, [semitoneShift, playbackReady]);
 
   useEffect(() => {
     return () => {
@@ -206,29 +333,23 @@ export default function Home() {
   }
 
   function togglePlay() {
-    const instrumentalEl = instrumentalAudioRef.current;
-    const vocalsEl = vocalsAudioRef.current;
-    if (!instrumentalEl || !vocalsEl) return;
+    const instrumentalHandle = instrumentalNodeRef.current;
+    const vocalsHandle = vocalsNodeRef.current;
+    if (!instrumentalHandle || !vocalsHandle) return;
 
     if (isPlaying) {
-      instrumentalEl.pause();
-      vocalsEl.pause();
+      instrumentalHandle.pause();
+      vocalsHandle.pause();
       setIsPlaying(false);
       return;
     }
 
     const ctx = getAudioContext();
-    if (ctx.state === "suspended") ctx.resume();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
-    if (instrumentalEl.ended) {
-      instrumentalEl.currentTime = 0;
-      vocalsEl.currentTime = 0;
-    }
-    vocalsEl.currentTime = instrumentalEl.currentTime;
-
-    Promise.all([instrumentalEl.play(), vocalsEl.play()])
-      .then(() => setIsPlaying(true))
-      .catch(() => setError("Couldn't start playback. Please try again."));
+    instrumentalHandle.play();
+    vocalsHandle.play();
+    setIsPlaying(true);
   }
 
   function handleVocalLevelChange(value: number) {
@@ -246,10 +367,14 @@ export default function Home() {
     setVocalLevel(DEFAULT_VOCAL_LEVEL);
     setIsPlaying(false);
     setElapsed(0);
-    setDuration(0);
     setError("");
     setProgress(8);
     setPhraseIndex(0);
+    setDetectedTonic(null);
+    setDetectedMode(null);
+    setSelectedTonic(null);
+    setPlaybackReady(false);
+    setPitchShiftAvailable(true);
   }
 
   async function handleDownload() {
@@ -257,38 +382,46 @@ export default function Home() {
     setIsRendering(true);
     setError("");
     try {
-      const ctx = getAudioContext();
-      const decodeStem = async (url: string) => {
-        const response = await fetch(url);
-        const arrayBuffer = await response.arrayBuffer();
-        return ctx.decodeAudioData(arrayBuffer);
-      };
-      const [instrumentalBuffer, vocalsBuffer] = await Promise.all([
-        decodeStem(stems.instrumentalUrl),
-        decodeStem(stems.vocalsUrl),
-      ]);
-
+      const { instrumentalBuffer, vocalsBuffer } = stems;
       const length = Math.max(instrumentalBuffer.length, vocalsBuffer.length);
+      // Tempo stays 1 (only pitch changes), so the rendered length is the
+      // same regardless of the chosen key.
       const offlineCtx = new OfflineAudioContext(2, length, instrumentalBuffer.sampleRate);
 
-      const instrumentalSource = offlineCtx.createBufferSource();
-      instrumentalSource.buffer = instrumentalBuffer;
-      instrumentalSource.connect(offlineCtx.destination);
-      instrumentalSource.start(0);
+      const buildOfflineHandle = (buf: AudioBuffer) =>
+        createPitchShiftNode(offlineCtx, buf, { autoPlay: true }).catch((err) => {
+          console.error("Pitch-shift render unavailable, falling back to plain render:", err);
+          const handle = createNativePlaybackNode(offlineCtx, buf);
+          handle.play();
+          return handle;
+        });
 
-      const vocalsSource = offlineCtx.createBufferSource();
-      vocalsSource.buffer = vocalsBuffer;
+      const [instrumentalHandle, vocalsHandle] = await Promise.all([
+        buildOfflineHandle(instrumentalBuffer),
+        buildOfflineHandle(vocalsBuffer),
+      ]);
+      const appliedShift = instrumentalHandle.supportsPitchShift && vocalsHandle.supportsPitchShift ? semitoneShift : 0;
+      instrumentalHandle.setPitchSemitones(appliedShift);
+      vocalsHandle.setPitchSemitones(appliedShift);
+      instrumentalHandle.node.connect(offlineCtx.destination);
       const gainNode = offlineCtx.createGain();
       gainNode.gain.value = vocalLevel / 100;
-      vocalsSource.connect(gainNode).connect(offlineCtx.destination);
-      vocalsSource.start(0);
+      vocalsHandle.node.connect(gainNode);
+      gainNode.connect(offlineCtx.destination);
+
+      // Rendering must not start until both worklets have actually
+      // received their audio (and, per autoPlay, are already marked
+      // playing) - otherwise startRendering() could race ahead of the
+      // still-in-flight buffer transfer and render silence.
+      await Promise.all([instrumentalHandle.whenLoaded(), vocalsHandle.whenLoaded()]);
 
       const rendered = await offlineCtx.startRendering();
       const blob = audioBufferToWavBlob(rendered);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${stems.title} (vocals ${vocalLevel}%).wav`;
+      const keySuffix = appliedShift === 0 ? "" : `, key ${appliedShift > 0 ? "+" : ""}${appliedShift}`;
+      a.download = `${stems.title} (vocals ${vocalLevel}%${keySuffix}).wav`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -386,21 +519,30 @@ export default function Home() {
         }
 
         // We have the finished result - from here on, any failure (a bad
-        // payload, a browser quirk building the blob URLs) is a real, fatal
+        // payload, a browser quirk decoding the audio) is a real, fatal
         // error, not a network hiccup. It must never fall back into the
         // retry path above, or the UI would silently loop "working"
         // forever instead of ever surfacing the problem.
         stopTimers();
         try {
+          const ctx = getAudioContext();
+          const [instrumentalBuffer, vocalsBuffer] = await Promise.all([
+            ctx.decodeAudioData(base64ToArrayBuffer(statusBody.instrumental_base64 as string)),
+            ctx.decodeAudioData(base64ToArrayBuffer(statusBody.vocals_base64 as string)),
+          ]);
           setProgress(100);
           setElapsed(0);
-          setDuration(0);
           setIsPlaying(false);
           setVocalLevel(DEFAULT_VOCAL_LEVEL);
+          setDetectedTonic(null);
+          setDetectedMode(null);
+          setSelectedTonic(null);
+          setPlaybackReady(false);
+          setPitchShiftAvailable(true);
           setStems({
             title: (statusBody.title as string) || "song",
-            instrumentalUrl: base64ToBlobUrl(statusBody.instrumental_base64 as string, "audio/mpeg"),
-            vocalsUrl: base64ToBlobUrl(statusBody.vocals_base64 as string, "audio/mpeg"),
+            instrumentalBuffer,
+            vocalsBuffer,
           });
           setPhase("done");
         } catch (err) {
@@ -489,9 +631,12 @@ export default function Home() {
                 type="button"
                 className={styles.playButton}
                 onClick={togglePlay}
-                aria-label={isPlaying ? "Pause" : "Play"}
+                disabled={!playbackReady}
+                aria-label={!playbackReady ? "Loading" : isPlaying ? "Pause" : "Play"}
               >
-                {isPlaying ? (
+                {!playbackReady ? (
+                  <span className={styles.spinner} aria-hidden="true" />
+                ) : isPlaying ? (
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                     <rect x="5" y="4" width="5" height="16" rx="1" />
                     <rect x="14" y="4" width="5" height="16" rx="1" />
@@ -505,10 +650,25 @@ export default function Home() {
               <div className={styles.trackMeta}>
                 <div className={styles.trackName}>{stems.title}</div>
                 <div className={styles.trackSub}>
-                  {formatTime(elapsed)} / {formatTime(duration)}
+                  {playbackReady ? `${formatTime(elapsed)} / ${formatTime(duration)}` : "Preparing playback…"}
                 </div>
               </div>
             </div>
+
+            <div className={styles.sectionLabel}>Key</div>
+            {playbackReady && !pitchShiftAvailable ? (
+              <p className={styles.subline} style={{ marginTop: 0 }}>
+                Key changing isn&apos;t available in this browser, but playback still works.
+              </p>
+            ) : (
+              <KeyWheel
+                detectedTonic={detectedTonic}
+                detectedMode={detectedMode}
+                selectedTonic={selectedTonic}
+                onSelectTonic={setSelectedTonic}
+                disabled={detectedTonic === null}
+              />
+            )}
 
             <div className={styles.sliderBlock}>
               <div className={styles.sliderLabelRow}>
@@ -541,6 +701,20 @@ export default function Home() {
             </button>
           </>
         ) : null}
+
+        <div className={styles.diagnostics}>
+          <button type="button" className={styles.diagnosticsButton} onClick={playTestTone}>
+            {testToneStatus === "playing" ? "Playing beep…" : "Test sound"}
+          </button>
+          <span className={styles.diagnosticsText}>
+            audio: {diagnostics.audioContextState}
+            {" · "}worklet: {diagnostics.audioWorkletSupported}
+            {testToneStatus === "done" && " · beep played"}
+          </span>
+          {diagnostics.lastGlobalError && (
+            <span className={styles.diagnosticsText}>error: {diagnostics.lastGlobalError}</span>
+          )}
+        </div>
       </div>
     </main>
   );
